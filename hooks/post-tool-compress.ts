@@ -100,15 +100,15 @@ function compressStringField(
     return { changed: false, value: text };
   }
 
-  // structured:format-strip + snip,不走 dedup。
-  // 理由:结构化输出大量是文件清单/路径(find/grep/ls),路径天然高频重复,
-  // dedup 会把路径压成 @n,破坏扫路径可读性,而省的极少(实测仅 ~3.7%)。
-  // 省 token 大头靠 snip 头尾截断。dedup 原语保留,留待后续日志模板去重等场景。
-  // mixed:保守,只用 format-strip(去 ANSI/空白,对散文无害),不 snip/dedup
+  // structured:format-strip + snip(头尾截断)。
+  // 省 token 大头靠 snip。dedup 原语已移除:在"存原文+store 取回"架构下其可逆性
+  // 是死路径(模型取回走 store 不走 decompress),退化成有损缩写且把路径压成 @n
+  // 伤可读性,实测收益仅 ~8% 且 74% 集中在单条日志。详见设计文档。
+  // mixed:保守,只用 format-strip(去 ANSI/空白,对散文无害),不 snip
   const result =
     cls.type === "mixed"
-      ? compress(text, { enableSnip: false, enableDedup: false })
-      : compress(text, { enableDedup: false });
+      ? compress(text, { enableSnip: false })
+      : compress(text);
 
   if (!result.compressed) {
     return { changed: false, value: text };

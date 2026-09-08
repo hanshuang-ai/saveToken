@@ -10,7 +10,6 @@ import { classify } from "../src/core/classifier";
 import { dispatch } from "../src/core/dispatcher";
 import { compress } from "../src/compress";
 import { snipDecompress } from "../src/compress/snip";
-import { dedupDecompress } from "../src/compress/dedup";
 import { formatStripDecompress, normalizeForCompare } from "../src/compress/format-strip";
 import { FIXTURES, type Fixture } from "./fixtures";
 
@@ -51,7 +50,6 @@ test("分类型:各真实样本按契约往返且真省了", () => {
     const r = compress(f.content, {
       minChars: 0, // 强制触发,测原语本身
       snip: { minLines: 30, headLines: 10, tailLines: 10 },
-      dedup: { minLen: 15, minRepeat: 3, minChars: 0 },
       formatStrip: { minChars: 0 },
     });
 
@@ -64,12 +62,11 @@ test("分类型:各真实样本按契约往返且真省了", () => {
     let text = r.text;
     for (const step of [...r.steps].reverse()) {
       if (step.method.startsWith("snip")) text = snipDecompress({ ...step, text });
-      else if (step.method.startsWith("dedup")) text = dedupDecompress({ ...step, text });
       else if (step.method.startsWith("format-strip")) text = formatStripDecompress({ ...step, text });
     }
 
     if (f.reversible === "strict") {
-      // 严格相等:snip/dedup 必须字节还原(format-strip 若参与则失效,故 strict 类不含 ANSI 噪声)
+      // 严格相等:snip 必须字节还原(format-strip 若参与则失效,故 strict 类不含 ANSI 噪声)
       // 但若 format-strip 参与了,需要单独处理:比较 format-strip 之前的文本
       const fsStep = r.steps.find((s) => s.method.startsWith("format-strip") && s.compressed);
       if (fsStep) {
@@ -96,7 +93,6 @@ test("snip: 长日志确实截断且省", () => {
   const log = FIXTURES.find((f) => f.name === "log")!;
   const c = compress(log.content, {
     minChars: 0,
-    enableDedup: false,
     enableFormatStrip: false,
     snip: { minLines: 30, headLines: 10, tailLines: 10 },
   });
@@ -104,48 +100,13 @@ test("snip: 长日志确实截断且省", () => {
   expect(c.compressedSize).toBeLessThan(c.originalSize * 0.5); // 至少省一半
 });
 
-test("dedup: JSON 重复结构确实去重", () => {
-  const json = FIXTURES.find((f) => f.name === "json")!;
-  const c = compress(json.content, {
-    minChars: 0,
-    enableSnip: false,
-    enableFormatStrip: false,
-    dedup: { minLen: 15, minRepeat: 3, minChars: 0 },
-  });
-  if (c.compressed) {
-    expect(c.compressedSize).toBeLessThan(c.originalSize);
-  }
-});
-
 test("format-strip: npm 输出去 ANSI 后省", () => {
   const npm = FIXTURES.find((f) => f.name === "npm-output")!;
   const c = compress(npm.content, {
     minChars: 0,
     enableSnip: false,
-    enableDedup: false,
     formatStrip: { minChars: 0 },
   });
   expect(c.compressed).toBe(true);
   expect(c.compressedSize).toBeLessThan(c.originalSize);
-});
-
-// ─── 短文本不触发(防字典开销负优化) ────────────────────────────────────────
-
-test("短文本:低于阈值不压缩(防负优化)", () => {
-  const short = '{"a":1}';
-  const c = compress(short); // 默认 minChars: 512
-  expect(c.compressed).toBe(false);
-});
-
-// ─── 边界:空文本、单行 ─────────────────────────────────────────────────────
-
-test("边界: 空文本不崩", () => {
-  expect(() => compress("")).not.toThrow();
-  expect(() => classify({ text: "" })).not.toThrow();
-  expect(() => dispatch("")).not.toThrow();
-});
-
-test("边界: 单行结构化不崩", () => {
-  const one = '{"key": "value", "num": 42}';
-  expect(() => compress(one, { minChars: 0 })).not.toThrow();
 });

@@ -47,12 +47,11 @@ export function dispatch(
 
   // structured:进入完整压缩管道
   // mixed:保守策略,只用 format-strip(去 ANSI/空白,对散文无害),
-  //        不用 snip/dedup(可能伤叙事部分)
+  //        不用 snip(可能伤叙事部分)
   if (classification.type === "mixed") {
     const result = compress(input, {
       ...compressOpts,
       enableSnip: false,
-      enableDedup: false,
       // format-strip 保持开启
     });
     return {

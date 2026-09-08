@@ -14,7 +14,6 @@ import {
   formatStripDecompress,
   normalizeForCompare,
 } from "../src/compress/format-strip";
-import { dedupCompress, dedupDecompress } from "../src/compress/dedup";
 import { compress, roundTripEqual } from "../src/compress";
 
 // ─── snip 截断往返 ─────────────────────────────────────────────────────────
@@ -68,30 +67,11 @@ test("format-strip: 纯文本无 ANSI 时不误伤", () => {
   expect(normalizeForCompare(restored)).toBe(normalizeForCompare(original));
 });
 
-// ─── dedup 反向引用往返 ────────────────────────────────────────────────────
-
-test("dedup: 重复串替换后可严格还原", () => {
-  const repeated = "this-is-a-long-repeated-string-token";
-  const original = `${repeated} aaa ${repeated} bbb ${repeated} ccc ${repeated}`;
-  const compressed = dedupCompress(original, { minLen: 15, minRepeat: 3, minChars: 0 });
-  expect(compressed.compressed).toBe(true);
-  const restored = dedupDecompress(compressed);
-  // dedup 是严格相等
-  expect(restored).toBe(original);
-});
-
-test("dedup: 无重复时不动", () => {
-  const original = "each word here is unique and different from others";
-  const compressed = dedupCompress(original, { minLen: 20, minRepeat: 3, minChars: 0 });
-  expect(compressed.compressed).toBe(false);
-});
-
 // ─── 聚合管道往返 ──────────────────────────────────────────────────────────
 
-test("聚合: 三原语串联后往返语义等价", () => {
-  const repeated = "repeated-structural-token-xyz";
-  const noisy = `\x1b[32m${repeated}\x1b[0m start\n`;
-  const block = `${noisy}${repeated} middle ${repeated} end`;
+test("聚合: 两原语串联后往返语义等价", () => {
+  const noisy = `\x1b[32mstructural token\x1b[0m start\n`;
+  const block = `${noisy}middle content here end`;
   const original = block.repeat(8); // 足够长触发各阈值
   expect(roundTripEqual(original, { minChars: 0 })).toBe(true);
 });
@@ -131,7 +111,6 @@ test("fuzz: 50 组随机输入往返全部语义等价", () => {
     const ok = roundTripEqual(original, {
       minChars: 0,
       snip: { minLines: 50 },
-      dedup: { minLen: 10, minRepeat: 2, minChars: 0 },
     });
     if (!ok) {
       console.log(`FAIL at i=${i} len=${original.length}`);
