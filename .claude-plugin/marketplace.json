@@ -1,0 +1,12 @@
+{
+  "name": "lcy-tools",
+  "description": "lcy 的个人插件集合",
+  "owner": { "name": "lcy" },
+  "plugins": [
+    {
+      "name": "frugal",
+      "source": ".",
+      "description": "通用 token 节省插件 —— 内容感知核心 + 可插拔适配器"
+    }
+  ]
+}

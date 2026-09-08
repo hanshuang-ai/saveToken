@@ -1,0 +1,13 @@
+{
+  "name": "savetoken",
+  "version": "0.0.1",
+  "description": "通用 token 节省插件 —— 内容感知核心 + 可插拔适配器",
+  "type": "module",
+  "scripts": {
+    "diagnose": "bun run src/diagnose.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}
