@@ -43,6 +43,62 @@ export interface SearchHit {
   rank: number;
 }
 
+/** 代码符号定义(函数/类/方法)——Task #18 代码 AST 图检索 */
+export interface SymbolRecord {
+  handle: string;
+  name: string;
+  kind: string; // function/class/method/variable
+  startLine: number; // 1-based,对齐原文行号
+  endLine: number;
+  bodyText?: string; // 完整实现(主符号取回用)
+  signature?: string; // 精简签名(引用符号取回用,控 token)
+  exported: boolean;
+  lang?: string; // typescript/tsx/javascript
+  createdAt: number;
+}
+
+/** 代码引用边(调用/导入)——跨文件解析核心 */
+export interface RefRecord {
+  id?: number;
+  fromHandle: string;
+  fromSymbol?: string; // 调用方符号名
+  toHandle?: string; // 被调用方句柄(已读解析、未读 undefined)
+  toSymbol: string; // 被调用符号名
+  refType: string; // call/import/inherit
+  line: number; // 1-based
+  resolved: boolean;
+  importSrc?: string; // import 原始字符串(未解析时供提示)
+  createdAt: number;
+}
+
+/** symbols 表原始行(SQL 列名带下划线,内部用) */
+interface SymbolRow {
+  handle: string;
+  name: string;
+  kind: string;
+  start_line: number;
+  end_line: number;
+  body_text: string | null;
+  signature: string | null;
+  exported: number;
+  lang: string | null;
+  created_at: number;
+}
+
+/** refs 表原始行(SQL 列名带下划线,内部用) */
+interface RefRow {
+  id: number;
+  from_handle: string;
+  from_symbol: string | null;
+  to_handle: string | null;
+  to_symbol: string;
+  ref_type: string;
+  line: number;
+  resolved: number;
+  import_src: string | null;
+  created_at: number;
+}
+
 /** 度量记录入参 */
 export interface MetricInput {
   handle?: string;
@@ -52,6 +108,7 @@ export interface MetricInput {
   originalSize: number;
   compressedSize: number;
   method: string;
+  sessionId?: string;
   createdAt: number;
 }
 
@@ -68,6 +125,32 @@ export interface MetricSummary {
   byType: Record<string, { count: number; saved: number }>;
   /** 被取回的记录数(成功率信号:取回多=压缩太激进) */
   retrievedCount: number;
+}
+
+/** 单个会话的度量汇总(会话级统计) */
+export interface SessionStat {
+  sessionId: string | null;
+  count: number;
+  original: number;
+  compressed: number;
+  saved: number;
+  lastAt: number;
+}
+
+/** 单条度量明细(逐条分析用) */
+export interface MetricRecord {
+  id: number;
+  tool: string | null;
+  contentType: string;
+  originalSize: number;
+  compressedSize: number;
+  saved: number;
+  /** 节省百分比 0-100 */
+  savedPct: number;
+  method: string | null;
+  retrievedCount: number;
+  sessionId: string | null;
+  createdAt: number;
 }
 
 class Store {
@@ -94,6 +177,15 @@ class Store {
   private initSchema(): void {
     const schema = readFileSync(SCHEMA_PATH, "utf-8");
     this.db!.exec(schema);
+    // 迁移:旧库的 metrics 没有 session_id 列(schema.sql 用 CREATE TABLE IF NOT EXISTS,
+    // 旧库不会自动加列)。检测缺失则补列,实现跨版本升级。
+    const cols = this.db!.prepare("PRAGMA table_info(metrics)").all() as { name: string }[];
+    if (cols.length > 0 && !cols.some((c) => c.name === "session_id")) {
+      this.db!.exec("ALTER TABLE metrics ADD COLUMN session_id TEXT");
+    }
+    // session_id 索引在迁移加列之后建:旧库此时才有该列。若放 schema.sql,
+    // 旧库 exec(schema) 时列还不存在,建索引会报 "no such column" 使 initSchema 整个失败。
+    this.db!.exec("CREATE INDEX IF NOT EXISTS idx_metrics_session ON metrics(session_id)");
   }
 
   close(): void {
@@ -236,14 +328,186 @@ class Store {
     return lines.slice(start, end).join("\n");
   }
 
+  // ─── 代码符号图谱(Task #18:代码 AST 图检索)─────────────────────────────
+  // 参考 CodeGraph:symbols + refs 持久化到 SQLite。MCP server 懒解析某 handle 后填这两表,
+  // 后续查表(快);跨会话/重启不丢。WAL 跨进程:hook 写 orig-N,MCP 读写这两表。
+
+  /** 该 handle 是否已索引符号——graph.ts 据此决定是否触发 indexCode */
+  hasSymbols(handle: string): boolean {
+    const db = this.ensureOpen();
+    const row = db
+      .prepare("SELECT 1 FROM symbols WHERE handle = ? LIMIT 1")
+      .get(handle);
+    return !!row;
+  }
+
+  /** 按源路径查原文句柄(跨文件 import 解析:候选路径 → 命中的 orig-N) */
+  getOriginalBySource(path: string): string | undefined {
+    const db = this.ensureOpen();
+    const row = db
+      .prepare(
+        "SELECT handle FROM originals WHERE source = ? ORDER BY created_at DESC LIMIT 1"
+      )
+      .get(path) as { handle: string } | null;
+    return row?.handle;
+  }
+
+  /** 幂等写符号:先删该 handle 旧记录,再批量插 */
+  saveSymbols(handle: string, symbols: SymbolRecord[]): void {
+    const db = this.ensureOpen();
+    const del = db.prepare("DELETE FROM symbols WHERE handle = ?");
+    const ins = db.prepare(
+      `INSERT INTO symbols(handle, name, kind, start_line, end_line, body_text, signature, exported, lang, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    db.exec("BEGIN");
+    try {
+      del.run(handle);
+      for (const s of symbols) {
+        ins.run(
+          handle,
+          s.name,
+          s.kind,
+          s.startLine,
+          s.endLine,
+          s.bodyText ?? null,
+          s.signature ?? null,
+          s.exported ? 1 : 0,
+          s.lang ?? null,
+          s.createdAt
+        );
+      }
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** 幂等写引用边:先删该 handle 旧记录,再批量插 */
+  saveReferences(handle: string, refs: RefRecord[]): void {
+    const db = this.ensureOpen();
+    const del = db.prepare("DELETE FROM refs WHERE from_handle = ?");
+    const ins = db.prepare(
+      `INSERT INTO refs(from_handle, from_symbol, to_handle, to_symbol, ref_type, line, resolved, import_src, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    db.exec("BEGIN");
+    try {
+      del.run(handle);
+      for (const r of refs) {
+        ins.run(
+          handle,
+          r.fromSymbol ?? null,
+          r.toHandle ?? null,
+          r.toSymbol,
+          r.refType,
+          r.line,
+          r.resolved ? 1 : 0,
+          r.importSrc ?? null,
+          r.createdAt
+        );
+      }
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** 取某 handle 的所有符号(按行号序) */
+  getSymbols(handle: string): SymbolRecord[] {
+    const db = this.ensureOpen();
+    const rows = db
+      .prepare("SELECT * FROM symbols WHERE handle = ? ORDER BY start_line")
+      .all(handle) as SymbolRow[];
+    return rows.map((r) => this.symbolFromRow(r));
+  }
+
+  /** 按名查符号(精确) */
+  findSymbolByName(handle: string, name: string): SymbolRecord | undefined {
+    const db = this.ensureOpen();
+    const row = db
+      .prepare("SELECT * FROM symbols WHERE handle = ? AND name = ? LIMIT 1")
+      .get(handle, name) as SymbolRow | null;
+    return row ? this.symbolFromRow(row) : undefined;
+  }
+
+  /** 模糊查符号(LIKE)——symbol 参数不精确时用 */
+  findSymbolFuzzy(handle: string, query: string): SymbolRecord[] {
+    const db = this.ensureOpen();
+    const rows = db
+      .prepare(
+        "SELECT * FROM symbols WHERE handle = ? AND name LIKE ? ORDER BY start_line"
+      )
+      .all(handle, `%${query}%`) as SymbolRow[];
+    return rows.map((r) => this.symbolFromRow(r));
+  }
+
+  /**
+   * 取引用边。
+   *  direction="callees":symbol 调用了谁 → from_handle=handle AND from_symbol=symbol
+   *  direction="callers":谁调用了 symbol → to_handle=handle AND to_symbol=symbol(跨文件)
+   */
+  getReferences(
+    handle: string,
+    direction: "callers" | "callees",
+    symbol: string
+  ): RefRecord[] {
+    const db = this.ensureOpen();
+    const rows =
+      direction === "callees"
+        ? (db
+            .prepare(
+              "SELECT * FROM refs WHERE from_handle = ? AND from_symbol = ? ORDER BY line"
+            )
+            .all(handle, symbol) as RefRow[])
+        : (db
+            .prepare(
+              "SELECT * FROM refs WHERE to_handle = ? AND to_symbol = ? ORDER BY line"
+            )
+            .all(handle, symbol) as RefRow[]);
+    return rows.map((r) => this.refFromRow(r));
+  }
+
+  private symbolFromRow(r: SymbolRow): SymbolRecord {
+    return {
+      handle: r.handle,
+      name: r.name,
+      kind: r.kind,
+      startLine: r.start_line,
+      endLine: r.end_line,
+      bodyText: r.body_text ?? undefined,
+      signature: r.signature ?? undefined,
+      exported: !!r.exported,
+      lang: r.lang ?? undefined,
+      createdAt: r.created_at,
+    };
+  }
+
+  private refFromRow(r: RefRow): RefRecord {
+    return {
+      id: r.id,
+      fromHandle: r.from_handle,
+      fromSymbol: r.from_symbol ?? undefined,
+      toHandle: r.to_handle ?? undefined,
+      toSymbol: r.to_symbol,
+      refType: r.ref_type,
+      line: r.line,
+      resolved: !!r.resolved,
+      importSrc: r.import_src ?? undefined,
+      createdAt: r.created_at,
+    };
+  }
+
   // ─── 度量记录 ────────────────────────────────────────────────────────────
 
   /** 记一条度量 */
   recordMetric(m: MetricInput): void {
     const db = this.ensureOpen();
     db.prepare(
-      `INSERT INTO metrics(handle, source, tool, content_type, original_size, compressed_size, method, retrieved_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
+      `INSERT INTO metrics(handle, source, tool, content_type, original_size, compressed_size, method, retrieved_count, session_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
     ).run(
       m.handle ?? null,
       m.source ?? null,
@@ -252,6 +516,7 @@ class Store {
       m.originalSize,
       m.compressedSize,
       m.method,
+      m.sessionId ?? null,
       m.createdAt
     );
   }
@@ -264,7 +529,8 @@ class Store {
     );
   }
 
-  /** 度量汇总(供 tok_stats) */
+  /** 度量汇总(供 tok_stats)。过滤 dedup 残留:该原语已移除(决策记录-1),
+   *  旧 metrics 行的 method 含 'dedup' 无法复现且虚高节省率,统计时排除。 */
   getMetricSummary(): MetricSummary {
     const db = this.ensureOpen();
     const overall = db
@@ -275,7 +541,8 @@ class Store {
            SUM(original_size) AS total_original,
            SUM(compressed_size) AS total_compressed,
            SUM(retrieved_count) AS retrieved
-         FROM metrics`
+         FROM metrics
+         WHERE method NOT LIKE '%dedup%'`
       )
       .get() as {
       total: number;
@@ -288,7 +555,9 @@ class Store {
     const byTypeRows = db
       .prepare(
         `SELECT content_type, COUNT(*) AS count, SUM(original_size - compressed_size) AS saved
-         FROM metrics GROUP BY content_type`
+         FROM metrics
+         WHERE method NOT LIKE '%dedup%'
+         GROUP BY content_type`
       )
       .all() as { content_type: string; count: number; saved: number }[];
     const byType: Record<string, { count: number; saved: number }> = {};
@@ -308,6 +577,85 @@ class Store {
       byType,
       retrievedCount: overall.retrieved ?? 0,
     };
+  }
+
+  /** 会话级度量:按 session_id 分组,按最近活动时间降序。供 tok_stats 显示"本会话"。
+   *  同样过滤 dedup 残留。旧记录无 session_id 归为 null(显示为"未知")。 */
+  getSessionBreakdown(limit = 5): SessionStat[] {
+    const db = this.ensureOpen();
+    const rows = db
+      .prepare(
+        `SELECT session_id,
+                COUNT(*) AS count,
+                SUM(original_size) AS orig,
+                SUM(compressed_size) AS comp,
+                SUM(original_size - compressed_size) AS saved,
+                MAX(created_at) AS last_at
+         FROM metrics
+         WHERE method NOT LIKE '%dedup%'
+         GROUP BY session_id
+         ORDER BY last_at DESC
+         LIMIT ?`
+      )
+      .all(limit) as {
+      session_id: string | null;
+      count: number;
+      orig: number;
+      comp: number;
+      saved: number;
+      last_at: number;
+    }[];
+    return rows.map((r) => ({
+      sessionId: r.session_id,
+      count: r.count ?? 0,
+      original: r.orig ?? 0,
+      compressed: r.comp ?? 0,
+      saved: Math.max(0, r.saved ?? 0),
+      lastAt: r.last_at ?? 0,
+    }));
+  }
+
+  /** 逐条度量明细(最近 N 条),供 tok_stats 逐条展示与质量分析。
+   *  过滤 dedup 残留。按时间倒序(最近在上)。 */
+  getRecentMetrics(limit = 30): MetricRecord[] {
+    const db = this.ensureOpen();
+    const rows = db
+      .prepare(
+        `SELECT id, tool, content_type, original_size, compressed_size,
+                method, retrieved_count, session_id, created_at
+         FROM metrics
+         WHERE method NOT LIKE '%dedup%'
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(limit) as {
+      id: number;
+      tool: string | null;
+      content_type: string;
+      original_size: number;
+      compressed_size: number;
+      method: string | null;
+      retrieved_count: number;
+      session_id: string | null;
+      created_at: number;
+    }[];
+    return rows.map((r) => {
+      const orig = r.original_size ?? 0;
+      const comp = r.compressed_size ?? 0;
+      return {
+        id: r.id,
+        tool: r.tool,
+        contentType: r.content_type,
+        originalSize: orig,
+        compressedSize: comp,
+        saved: Math.max(0, orig - comp),
+        savedPct: orig > 0 ? Math.round((1 - comp / orig) * 100) : 0,
+        method: r.method,
+        retrievedCount: r.retrieved_count ?? 0,
+        sessionId: r.session_id,
+        createdAt: r.created_at,
+      };
+    });
   }
 
   // ─── 内部 ────────────────────────────────────────────────────────────────

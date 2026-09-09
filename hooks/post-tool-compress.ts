@@ -29,6 +29,7 @@ import { classify } from "../src/core/classifier";
 import { compress } from "../src/compress";
 import { store } from "../src/store/db";
 import { decisionLog } from "../src/core/decision-log";
+import { langForExt } from "../src/codegraph/languages";
 import { mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -87,6 +88,7 @@ function compressStringField(
   text: string,
   tool: string,
   path: string | undefined,
+  sessionId: string | undefined,
   now: number
 ): { changed: boolean; value: string } {
   if (text.length < MIN_CHARS) {
@@ -95,8 +97,10 @@ function compressStringField(
 
   const cls = classify({ text, tool, path });
 
-  // 散文一律放行(安全侧:绝不压叙事)
-  if (cls.type === "prose" || cls.type === "empty") {
+  // 散文与 mixed 一律放行(安全侧:绝不压叙事)。
+  // mixed 含散文部分,实测 format-strip ROI 仅 3-11%,却照常分类/存原文/记 metrics
+  // 产生噪音,不值得为这点收益冒险触碰叙事部分 → 与 prose 同等放行。
+  if (cls.type === "prose" || cls.type === "mixed" || cls.type === "empty") {
     return { changed: false, value: text };
   }
 
@@ -104,11 +108,7 @@ function compressStringField(
   // 省 token 大头靠 snip。dedup 原语已移除:在"存原文+store 取回"架构下其可逆性
   // 是死路径(模型取回走 store 不走 decompress),退化成有损缩写且把路径压成 @n
   // 伤可读性,实测收益仅 ~8% 且 74% 集中在单条日志。详见设计文档。
-  // mixed:保守,只用 format-strip(去 ANSI/空白,对散文无害),不 snip
-  const result =
-    cls.type === "mixed"
-      ? compress(text, { enableSnip: false })
-      : compress(text);
+  const result = compress(text);
 
   if (!result.compressed) {
     return { changed: false, value: text };
@@ -128,6 +128,7 @@ function compressStringField(
         originalSize: result.originalSize,
         compressedSize: result.compressedSize,
         method: result.steps.map((s) => s.method).join(","),
+        sessionId,
         createdAt: now,
       });
     }
@@ -135,10 +136,31 @@ function compressStringField(
     // 存储失败不阻塞压缩流程
   }
 
-  // 末尾附原文 handle,供模型 tok_retrieve 取回完整原文
-  // (snip 的中间段 handle 已在省略标记里;这里是"完整原文"的 handle)
+  // 末尾附原文 handle + 检索引导:引导模型按需取片段/按行,而非倾倒全文。
+  // orig-N 是完整原文(FTS5 按原文行号建索引,startLine 正确);snip-(省略标记里)
+  // 是被截中间段,其索引按中间段内行号建,与原文行号错配 → 优先用 orig-N,
+  // 避免混用 snip- 的 startLine 拿到错位行。
+  // 统计型与压缩根本矛盾(全表分析需全数据在上下文)→ 引导计算下推(Bash 处理源文件)。
+  // 行数用压缩前的 text 算(compress 后 result.text 行数已变,不能用来报"共X行")。
+  const totalLines = text.split("\n").length;
+  const sourceTag = path ? `,来源:${path}` : "";
+  const statHint = path
+    ? `统计/聚合全表:用 Bash 处理源文件(如 awk/python ${path}),勿取回全文(耗token)。`
+    : `统计/聚合全表:重新用 Bash 跑统计命令(如 awk),勿取回全文(耗token)。`;
+  // 代码(TS/JS)走 AST 检索引导:tok_code_symbol/tok_code_refs 比扁平 FTS5 检索更准
+  // (能跨文件解析调用关系)。hook 只判扩展名(langForExt 纯数据,不背 tree-sitter 依赖);
+  // AST 解析在 MCP server 懒做(首次查某 handle 时 parse+存表,后续查表)。
+  const ext = (() => {
+    if (!path) return "";
+    const d = path.lastIndexOf(".");
+    const s = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+    return d > s ? path.slice(d + 1).toLowerCase() : "";
+  })();
+  const isCode = !!langForExt(ext);
   const note = handle
-    ? `\n\n「frugal:原文已存,handle=${handle},用 tok_retrieve 取回完整内容」`
+    ? isCode
+      ? `\n\n「frugal:原文已存,handle=${handle}(代码,共${totalLines}行${sourceTag})。省略标记里的 snip- 是截断中间段,查符号用 ${handle}(完整原文)。\n查函数/类完整实现:tok_code_symbol(handle="${handle}", symbol="函数名")。\n查调用关系(跨文件,谁调用/调用了谁):tok_code_refs(handle="${handle}", symbol="函数名", direction="callees")。\n查特定行:tok_retrieve(handle="${handle}", startLine=N, count=M)。\n勿取回全文(耗token)。」`
+      : `\n\n「frugal:原文已存,handle=${handle}(完整原文,共${totalLines}行${sourceTag})。省略标记里的 snip- handle 是被截中间段,${handle} 已含全文,优先用 ${handle}。\n查特定数据:tok_retrieve(handle="${handle}", query="关键词") 检索片段(约20行上下文),或 tok_retrieve(handle="${handle}", startLine=N, count=M) 按行取。\n${statHint}」`
     : "";
   return { changed: true, value: result.text + note };
 }
@@ -149,15 +171,16 @@ function rewriteToolResponse(
   node: unknown,
   tool: string,
   path: string | undefined,
+  sessionId: string | undefined,
   now: number
 ): { changed: boolean; value: unknown } {
   if (typeof node === "string") {
-    return compressStringField(node, tool, path, now);
+    return compressStringField(node, tool, path, sessionId, now);
   }
   if (Array.isArray(node)) {
     let changed = false;
     const value = node.map((item) => {
-      const r = rewriteToolResponse(item, tool, path, now);
+      const r = rewriteToolResponse(item, tool, path, sessionId, now);
       if (r.changed) changed = true;
       return r.value;
     });
@@ -167,7 +190,7 @@ function rewriteToolResponse(
     let changed = false;
     const value: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      const r = rewriteToolResponse(v, tool, path, now);
+      const r = rewriteToolResponse(v, tool, path, sessionId, now);
       if (r.changed) changed = true;
       value[k] = r.value;
     }
@@ -207,12 +230,16 @@ async function main(): Promise<void> {
   const path: string | undefined =
     typeof toolInput.file_path === "string" ? toolInput.file_path : undefined;
 
+  // 会话 ID(用于会话级统计;PostToolUse payload 标准字段)
+  const sessionId: string | undefined =
+    typeof data.session_id === "string" ? data.session_id : undefined;
+
   const now = Date.now();
   ensureDecisionLog();
 
   let rewritten: { changed: boolean; value: unknown };
   try {
-    rewritten = rewriteToolResponse(toolResponse, toolName, path, now);
+    rewritten = rewriteToolResponse(toolResponse, toolName, path, sessionId, now);
   } catch {
     return; // 压缩过程异常,放行(绝不破坏工具输出)
   }

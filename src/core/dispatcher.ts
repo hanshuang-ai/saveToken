@@ -5,7 +5,7 @@
  * 这是安全模型第零道闸门的代码实现:
  *   structured → 压(可逆无损原语)
  *   prose      → 放行(原样返回,不碰叙事)
- *   mixed      → 仅压缩可识别的结构化段(MVP 简化:整体按 structured 处理但降低激进度)
+ *   mixed      → 放行(含散文部分,format-strip ROI 仅 3-11%,不值得冒险)
  */
 
 import type { ContentType } from "./types";
@@ -33,34 +33,17 @@ export function dispatch(
   const classification = classify({ text: input, ...meta });
   const originalSize = input.length;
 
-  // 安全侧倾斜:prose 一律放行,哪怕看起来很长
-  if (classification.type === "prose") {
+  // 安全侧倾斜:prose 与 mixed 一律放行,哪怕看起来很长。
+  // mixed 含散文部分,实测 format-strip ROI 仅 3-11%(见度量),
+  // 却照常走分类/存原文/记 metrics 产生噪音,不值得为这点收益冒险触碰叙事部分。
+  if (classification.type === "prose" || classification.type === "mixed") {
     return {
       text: input,
       compressed: false,
-      contentType: "prose",
+      contentType: classification.type,
       steps: [],
       originalSize,
       compressedSize: input.length,
-    };
-  }
-
-  // structured:进入完整压缩管道
-  // mixed:保守策略,只用 format-strip(去 ANSI/空白,对散文无害),
-  //        不用 snip(可能伤叙事部分)
-  if (classification.type === "mixed") {
-    const result = compress(input, {
-      ...compressOpts,
-      enableSnip: false,
-      // format-strip 保持开启
-    });
-    return {
-      text: result.text,
-      compressed: result.compressed,
-      contentType: "mixed",
-      steps: result.steps,
-      originalSize: result.originalSize,
-      compressedSize: result.compressedSize,
     };
   }
 

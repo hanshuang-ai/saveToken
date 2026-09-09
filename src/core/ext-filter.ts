@@ -27,8 +27,10 @@ const STRUCTURED_EXT = new Set([
   // 标记/样式/模板
   "css", "scss", "less", "html", "htm", "xml", "ejs", "jst", "hbs",
   "vue", "svelte", "astro",
-  // 数据/配置(内容判断不可靠,必须扩展名兜底——.yml 实测 91% 被内容误判散文)
+  // 数据/配置(内容判断不可靠,必须扩展名兜底——.yml 实测 91% 被内容误判散文;
+  //   .csv 同理:无 {} 强符号、行结构相似度未触发,实测判 prose → 必须扩展名兜底)
   "json", "yaml", "yml", "toml", "ini", "conf", "properties", "env",
+  "csv", "tsv",
   "map", "wasm", "lock",
   // 日志/二进制/资源(命中即结构化)
   "log", "gz", "gzip", "zip", "tar", "tmp", "temp", "cache", "bak",

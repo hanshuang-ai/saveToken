@@ -22,6 +22,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { store } from "../store/db";
+import { retrieveSymbol, retrieveRefs } from "../codegraph/graph";
 
 // ─── 数据目录与 store 初始化 ──────────────────────────────────────────────────
 // 与 hook 脚本用同一份数据库,故路径逻辑保持一致。
@@ -106,14 +107,45 @@ function tokStats(): string {
   const byType = Object.entries(s.byType)
     .map(([t, v]) => `  ${t}: ${v.count} 条,省 ${v.saved} 字符`)
     .join("\n");
+  // 会话级统计:按 session_id 分组,最近的活动通常即当前会话
+  const sessions = store.getSessionBreakdown(5);
+  const sessionLines = sessions.length
+    ? sessions
+        .map((ss, i) => {
+          const tag = ss.sessionId ? ss.sessionId.slice(0, 8) : "(未知)";
+          const sp = ss.original > 0 ? ((ss.saved / ss.original) * 100).toFixed(0) : "0";
+          const mark = i === 0 ? "  ← 最近会话(通常即本会话)" : "";
+          return `  ${tag}: ${ss.count} 条,省 ${ss.saved} 字符(${sp}%)${mark}`;
+        })
+        .join("\n")
+    : "  (无会话信息)";
+  // 逐条明细:按时间倒序,展示每条的原始/压缩/节省%/取回,便于质量分析
+  const records = store.getRecentMetrics(30);
+  const recLines = records.length
+    ? records
+        .map((r) => {
+          const tool = (r.tool ?? "?").slice(0, 5).padEnd(5);
+          const type = r.contentType.slice(0, 10).padEnd(10);
+          const orig = String(r.originalSize).padStart(6);
+          const comp = String(r.compressedSize).padStart(5);
+          const pct2 = (r.savedPct + "%").padStart(4);
+          const ret = r.retrievedCount > 0 ? `取回${r.retrievedCount}` : "";
+          return `  ${tool} ${type} ${orig}→${comp} 省${pct2} ${ret}`;
+        })
+        .join("\n")
+    : "  (无记录)";
   return [
     `frugal 度量汇总:`,
     `  总记录: ${s.total} 条(其中压缩 ${s.compressed} 条)`,
     `  原始: ${s.totalOriginal} 字符 → 压缩后: ${s.totalCompressed} 字符`,
     `  节省: ${s.saved} 字符(${pct}%)`,
     `  被取回: ${s.retrievedCount} 次(取回多=压缩可能太激进,该调阈值)`,
+    `逐条明细(最近 ${records.length} 条):`,
+    recLines,
     `分类型:`,
     byType,
+    `分会话(最近 5 个):`,
+    sessionLines,
   ].join("\n");
 }
 
@@ -162,6 +194,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: "tok_code_symbol",
+      description:
+        "取代码符号定义(函数/类/方法)及完整实现。Read 代码被 frugal 截断后,查某函数完整代码+同文件调用关系用这个。用法:(1) handle+symbol 取该符号完整实现;(2) handle+query 模糊查符号列表;(3) 只传 handle 列出所有符号概览。仅支持 TS/JS。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          handle: {
+            type: "string",
+            description: "代码原文句柄(压缩结果里的 handle=orig-N)",
+          },
+          symbol: {
+            type: "string",
+            description: "可选:精确符号名(函数/类/方法名)",
+          },
+          query: {
+            type: "string",
+            description: "可选:模糊查询词,匹配符号名",
+          },
+        },
+        required: ["handle"],
+      },
+    },
+    {
+      name: "tok_code_refs",
+      description:
+        "取符号调用/被调用关系(跨文件自动解析)。查'bar 调用了什么'(callees)或'谁调用了 bar'(callers)。已读文件自动解析跨文件引用,未读文件提示 Read。仅支持 TS/JS。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          handle: {
+            type: "string",
+            description: "代码原文句柄(orig-N)",
+          },
+          symbol: {
+            type: "string",
+            description: "符号名(函数/方法名)",
+          },
+          direction: {
+            type: "string",
+            enum: ["callers", "callees"],
+            description: "callers=谁调用本符号;callees=本符号调用了谁",
+          },
+          depth: {
+            type: "number",
+            description: "可选:callees 递归深度(默认1,最大3)",
+          },
+        },
+        required: ["handle", "symbol", "direction"],
+      },
+    },
   ],
 }));
 
@@ -179,6 +262,37 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       text = r.text;
       // 仅当模型实际取回原文内容(命中/按行取到/全文)才累加取回计数。
       // 未命中、超大提示、错误不计——空查询不是"压缩太激进"的信号。
+      if (r.retrieved && args.handle) {
+        try {
+          store.incrementRetrieved(String(args.handle));
+        } catch {
+          // ignore
+        }
+      }
+    } else if (name === "tok_code_symbol") {
+      const r = await retrieveSymbol(
+        String(args.handle ?? ""),
+        args.symbol != null ? String(args.symbol) : undefined,
+        args.query != null ? String(args.query) : undefined
+      );
+      text = r.text;
+      if (r.retrieved && args.handle) {
+        try {
+          store.incrementRetrieved(String(args.handle));
+        } catch {
+          // ignore
+        }
+      }
+    } else if (name === "tok_code_refs") {
+      const direction = String(args.direction ?? "callees") as "callers" | "callees";
+      const depth = args.depth != null ? Number(args.depth) : 1;
+      const r = await retrieveRefs(
+        String(args.handle ?? ""),
+        String(args.symbol ?? ""),
+        direction,
+        depth
+      );
+      text = r.text;
       if (r.retrieved && args.handle) {
         try {
           store.incrementRetrieved(String(args.handle));
