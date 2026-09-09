@@ -11,6 +11,7 @@ import { dispatch } from "../src/core/dispatcher";
 import { compress } from "../src/compress";
 import { snipDecompress } from "../src/compress/snip";
 import { formatStripDecompress, normalizeForCompare } from "../src/compress/format-strip";
+import { structuredDigestDecompress } from "../src/compress/structured-digest";
 import { FIXTURES, type Fixture } from "./fixtures";
 
 // ─── 分类器:各 fixture 类型判定准确 ────────────────────────────────────────
@@ -62,6 +63,7 @@ test("分类型:各真实样本按契约往返且真省了", () => {
     let text = r.text;
     for (const step of [...r.steps].reverse()) {
       if (step.method.startsWith("snip")) text = snipDecompress({ ...step, text });
+      else if (step.method.startsWith("structured-digest")) text = structuredDigestDecompress({ ...step, text });
       else if (step.method.startsWith("format-strip")) text = formatStripDecompress({ ...step, text });
     }
 

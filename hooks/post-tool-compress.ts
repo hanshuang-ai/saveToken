@@ -160,7 +160,7 @@ function compressStringField(
   const note = handle
     ? isCode
       ? `\n\n「frugal:原文已存,handle=${handle}(代码,共${totalLines}行${sourceTag})。省略标记里的 snip- 是截断中间段,查符号用 ${handle}(完整原文)。\n查函数/类完整实现:tok_code_symbol(handle="${handle}", symbol="函数名")。\n查调用关系(跨文件,谁调用/调用了谁):tok_code_refs(handle="${handle}", symbol="函数名", direction="callees")。\n查特定行:tok_retrieve(handle="${handle}", startLine=N, count=M)。\n勿取回全文(耗token)。」`
-      : `\n\n「frugal:原文已存,handle=${handle}(完整原文,共${totalLines}行${sourceTag})。省略标记里的 snip- handle 是被截中间段,${handle} 已含全文,优先用 ${handle}。\n查特定数据:tok_retrieve(handle="${handle}", query="关键词") 检索片段(约20行上下文),或 tok_retrieve(handle="${handle}", startLine=N, count=M) 按行取。\n${statHint}」`
+      : `\n\n「frugal:原文已存,handle=${handle}(完整原文,共${totalLines}行${sourceTag})。省略标记是压缩视图(中间段或结构化摘要),${handle} 已含全文,优先用 ${handle}。\n查特定数据:tok_retrieve(handle="${handle}", query="关键词") 检索片段(约20行上下文),或 tok_retrieve(handle="${handle}", startLine=N, count=M) 按行取。\n${statHint}」`
     : "";
   return { changed: true, value: result.text + note };
 }

@@ -17,6 +17,10 @@ export {
  formatStripDecompress,
  normalizeForCompare,
 } from "./format-strip";
+export {
+ structuredDigestCompress,
+ structuredDigestDecompress,
+} from "./structured-digest";
 
 import type { Compressed } from "../core/types";
 import { snipCompress, snipDecompress } from "./snip";
@@ -25,29 +29,37 @@ import {
  formatStripDecompress,
  normalizeForCompare,
 } from "./format-strip";
+import {
+ structuredDigestCompress,
+ structuredDigestDecompress,
+} from "./structured-digest";
 
 export interface CompressOptions {
  /** 触发压缩的最小字符数(总入口阈值) */
  minChars?: number;
  snip?: Parameters<typeof snipCompress>[1];
  formatStrip?: Parameters<typeof formatStripCompress>[1];
+ structuredDigest?: Parameters<typeof structuredDigestCompress>[1];
  /** 各原语开关 */
  enableSnip?: boolean;
  enableFormatStrip?: boolean;
+ enableStructuredDigest?: boolean;
 }
 
 const DEFAULTS: Required<CompressOptions> = {
  minChars: 512,
  snip: {},
  formatStrip: {},
+ structuredDigest: {},
  enableSnip: true,
  enableFormatStrip: true,
+ enableStructuredDigest: true,
 };
 
 /**
- * 聚合压缩管道。顺序:format-strip → snip。
- * 先去噪(让后续步骤更干净),最后截断超长。
- * 每步只在自己有效时改文本。
+ * 聚合压缩管道。顺序:format-strip → structured-digest → snip。
+ * 先去噪,再对噪声主导的行式输出抽信号(digest 命中则输出已短,snip 自然 noop),
+ * 最后对剩余超长内容头尾截断。每步只在自己有效时改文本。
  */
 export function compress(input: string, opts: CompressOptions = {}): {
  text: string;
@@ -77,6 +89,12 @@ export function compress(input: string, opts: CompressOptions = {}): {
  text = r.text;
  if (r.compressed) anyCompressed = true;
  }
+ if (o.enableStructuredDigest) {
+ const r = structuredDigestCompress(text, o.structuredDigest);
+ steps.push(r);
+ text = r.text;
+ if (r.compressed) anyCompressed = true;
+ }
  if (o.enableSnip) {
  const r = snipCompress(text, o.snip);
  steps.push(r);
@@ -98,11 +116,12 @@ export function roundTripEqual(original: string, opts?: CompressOptions): boolea
  const r = compress(original, opts);
  if (!r.compressed) return true;
 
- // 逆序解压:snip → format-strip(与压缩顺序相反)
+ // 逆序解压:snip → structured-digest → format-strip(与压缩顺序相反)
  let text = r.text;
  const reversed = [...r.steps].reverse();
  for (const step of reversed) {
  if (step.method.startsWith("snip")) text = snipDecompress({ ...step, text });
+ else if (step.method.startsWith("structured-digest")) text = structuredDigestDecompress({ ...step, text });
  else if (step.method.startsWith("format-strip")) text = formatStripDecompress({ ...step, text });
  }
 

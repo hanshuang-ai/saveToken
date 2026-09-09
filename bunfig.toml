@@ -1,0 +1,4 @@
+[test]
+# 限制测试扫描到 tests/(排除 corpus/ 语料:SDKCollection/BLOG 自带 .test.mjs 非本项目测试)
+root = "tests"
+exclude = ["**/corpus/**"]

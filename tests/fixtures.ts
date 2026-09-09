@@ -123,12 +123,40 @@ const mixedSample = [
   "以上配置完成后,重启服务即可生效。",
 ].join("\n");
 
+// ─── 结构化:测试运行器输出(噪声主导,少数 FAIL 埋中间) ────────────────────
+
+const testRunnerSample = [
+  "",
+  "RERUN  src/core/dispatcher.test.ts v3",
+  "",
+  ...Array.from({ length: 200 }, (_, i) =>
+    `✓ src/core/dispatcher.test.ts (${i + 1}ms)`
+  ),
+  "",
+  "✗ src/compress/snip.test.ts > snip: 超长文本截断后可完整还原",
+  "  AssertionError: expected restored to equal original",
+  "    at /Users/dev/saveToken/tests/snip.test.ts:24:17",
+  "    at /Users/dev/saveToken/tests/snip.test.ts:40:5",
+  "",
+  "✗ src/compress/format-strip.test.ts > format-strip: ANSI 码剥离后语义不变",
+  "  error: expected true to be false",
+  "    at /Users/dev/saveToken/tests/format-strip.test.ts:18:12",
+  "",
+  ...Array.from({ length: 150 }, (_, i) =>
+    `✓ src/compress/format-strip.test.ts (${i + 1}ms)`
+  ),
+  "",
+  "Tests  1 failed | 352 passed | 2 skipped",
+  "Duration  1247ms",
+].join("\n");
+
 export const FIXTURES: Fixture[] = [
   { name: "json", content: jsonSample, expectedType: "structured", reversible: "semantic" },
   { name: "git-log", content: gitLog, expectedType: "structured", reversible: "strict" },
   { name: "npm-output", content: npmOutput, expectedType: "structured", reversible: "semantic" },
   { name: "code", content: codeSample, expectedType: "structured", reversible: "strict" },
   { name: "log", content: logSample, expectedType: "structured", reversible: "strict" },
+  { name: "test-runner", content: testRunnerSample, expectedType: "structured", reversible: "strict" },
   { name: "prose", content: proseSample, expectedType: "prose", reversible: "strict" },
   { name: "mixed", content: mixedSample, expectedType: "mixed", reversible: "semantic" },
 ];
