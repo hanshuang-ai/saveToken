@@ -115,6 +115,17 @@ function fmt(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** 字符数 → 估算 token 数 */
+function estTok(chars: number): number {
+  return Math.ceil(chars / 3.5);
+}
+
+function fmtTok(n: number): string {
+  if (n < 1000) return `${n} tok`;
+  if (n < 1000000) return `${(n / 1000).toFixed(1)}k tok`;
+  return `${(n / 1000000).toFixed(2)}M tok`;
+}
+
 function fmtTime(ts: number): string {
   return new Date(ts).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 }
@@ -128,7 +139,7 @@ function renderHTML(data: ReturnType<typeof queryData>): string {
     .map(([t, v]) => {
       const pct = (v.saved / maxSaved * 100).toFixed(0);
       return `<tr><td><span class="tag">${t}</span></td><td>${v.count}</td>
-        <td>${fmt(v.saved)}</td><td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td></tr>`;
+        <td>${fmtTok(estTok(v.saved))}</td><td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td></tr>`;
     }).join("");
 
   const maxTool = Math.max(...Object.values(byTool), 1);
@@ -146,17 +157,18 @@ function renderHTML(data: ReturnType<typeof queryData>): string {
       const pct = v.orig > 0 ? ((saved / v.orig) * 100).toFixed(0) : "0";
       const mark = i === 0 ? " ← 当前" : "";
       return `<tr><td><code>${tag}</code></td><td>${v.count}</td>
-        <td>${fmt(saved)} (${pct}%)</td><td>${fmtTime(v.latest)}</td>
+        <td>${fmtTok(estTok(saved))} (${pct}%)</td><td>${fmtTime(v.latest)}</td>
         <td style="color:#3fb950">${mark}</td></tr>`;
     }).join("");
 
   const metricRows = metrics.map((m: any) => {
     const pct = m.original_size > 0 ? ((1 - m.compressed_size / m.original_size) * 100).toFixed(0) : "0";
+    const tokSaved = estTok(m.original_size) - estTok(m.compressed_size);
     const ret = m.retrieved_count > 0 ? `<span class="tag-warn">取回${m.retrieved_count}</span>` : "-";
     return `<tr><td>${fmtTime(m.created_at)}</td><td>${m.tool}</td>
       <td><span class="tag">${m.content_type}</span></td>
-      <td>${fmt(m.original_size)}</td><td>${fmt(m.compressed_size)}</td>
-      <td><strong>${pct}%</strong></td><td>${m.method || "-"}</td><td>${ret}</td></tr>`;
+      <td>${fmtTok(estTok(m.original_size))}</td><td>${fmtTok(estTok(m.compressed_size))}</td>
+      <td><strong>${fmtTok(tokSaved)}</strong> (${pct}%)</td><td>${m.method || "-"}</td><td>${ret}</td></tr>`;
   }).join("");
 
   const decisionRows = decisions.map((d: any) =>
@@ -220,18 +232,20 @@ function renderHTML(data: ReturnType<typeof queryData>): string {
     <div class="sub">决策日志 ${summary.totalDecisions} 条</div>
   </div>
   <div class="card">
-    <div class="label">节省空间</div>
-    <div class="value">${fmt(summary.savedBytes)}</div>
+    <div class="label">节省 token</div>
+    <div class="value">${fmtTok(estTok(summary.savedBytes))}</div>
     <div class="sub">压缩率 ${summary.ratio}%</div>
     <div class="bar-pct" style="width:${Math.min(summary.ratio, 100)}%"></div>
   </div>
   <div class="card">
-    <div class="label">原始总量</div>
-    <div class="value">${fmt(summary.totalOriginalBytes)}</div>
+    <div class="label">原始 token</div>
+    <div class="value">${fmtTok(estTok(summary.totalOriginalBytes))}</div>
+    <div class="sub">${fmt(summary.totalOriginalBytes)}</div>
   </div>
   <div class="card">
-    <div class="label">压缩后</div>
-    <div class="value">${fmt(summary.totalCompressedBytes)}</div>
+    <div class="label">压缩后 token</div>
+    <div class="value">${fmtTok(estTok(summary.totalCompressedBytes))}</div>
+    <div class="sub">${fmt(summary.totalCompressedBytes)}</div>
   </div>
 </div>
 
@@ -253,7 +267,7 @@ function renderHTML(data: ReturnType<typeof queryData>): string {
 
 <div class="section">
   <h2>压缩记录 (最近 ${Math.min(metrics.length, 100)} 条)</h2>
-  ${metricRows ? `<table><thead><tr><th>时间</th><th>工具</th><th>类型</th><th>原始</th><th>压缩后</th><th>压缩率</th><th>方法</th><th>取回</th></tr></thead><tbody>${metricRows}</tbody></table>` : '<div class="empty">暂无记录</div>'}
+  ${metricRows ? `<table><thead><tr><th>时间</th><th>工具</th><th>类型</th><th>原始</th><th>压缩后</th><th>节省</th><th>方法</th><th>取回</th></tr></thead><tbody>${metricRows}</tbody></table>` : '<div class="empty">暂无记录</div>'}
 </div>
 
 <div class="section">

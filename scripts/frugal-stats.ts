@@ -1,7 +1,7 @@
 /**
  * scripts/frugal-stats.ts — frugal 压缩统计脚本
  *
- * 查询 DB + 决策日志,输出格式化统计。
+ * 查询 DB + 决策日志,输出格式化统计(token 为主)。
  * 供 /frugal:stats slash command 调用。
  */
 
@@ -14,7 +14,18 @@ const DATA = join(homedir(), "Desktop", "frugal");
 const DB_PATH = join(DATA, "frugal.db");
 const LOG_PATH = join(DATA, "hook-decisions.jsonl");
 
-function fmt(n: number): string {
+/** 字符数 → 估算 token 数(英文~4字符/token,JSON/代码~3.5,中文~1.5;取保守值 3.5) */
+function estTokens(chars: number): number {
+  return Math.ceil(chars / 3.5);
+}
+
+function fmtTok(n: number): string {
+  if (n < 1000) return `${n} tok`;
+  if (n < 1000000) return `${(n / 1000).toFixed(1)}k tok`;
+  return `${(n / 1000000).toFixed(2)}M tok`;
+}
+
+function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
@@ -24,7 +35,6 @@ function time(ts: number): string {
   return new Date(ts).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 }
 
-// 读决策日志
 function readDecisions(): any[] {
   if (!existsSync(LOG_PATH)) return [];
   try {
@@ -38,7 +48,6 @@ function readDecisions(): any[] {
   }
 }
 
-// 读 DB
 function readMetrics(): any[] {
   if (!existsSync(DB_PATH)) return [];
   try {
@@ -57,41 +66,45 @@ function readMetrics(): any[] {
   }
 }
 
-// 主输出
 const metrics = readMetrics();
 const decisions = readDecisions();
-
 const lines: string[] = [];
 
-// 汇总
 if (metrics.length === 0) {
-  lines.push("尚无压缩记录。");
-  lines.push("");
-  lines.push("hook 触发后(Read/Bash 大输出被压缩),数据会自动写入 DB。");
+  lines.push("尚无压缩记录。hook 触发后数据自动写入 DB。");
 } else {
   const totalOrig = metrics.reduce((s: number, m: any) => s + m.original_size, 0);
   const totalComp = metrics.reduce((s: number, m: any) => s + m.compressed_size, 0);
-  const saved = totalOrig - totalComp;
-  const ratio = totalOrig > 0 ? ((saved / totalOrig) * 100).toFixed(1) : "0";
+  const savedBytes = totalOrig - totalComp;
+  const ratio = totalOrig > 0 ? ((savedBytes / totalOrig) * 100).toFixed(1) : "0";
+
+  const tokOrig = estTokens(totalOrig);
+  const tokComp = estTokens(totalComp);
+  const tokSaved = tokOrig - tokComp;
 
   lines.push("## frugal 压缩统计");
   lines.push("");
   lines.push(`压缩次数: ${metrics.length}`);
-  lines.push(`原始总量: ${fmt(totalOrig)} → 压缩后: ${fmt(totalComp)}`);
-  lines.push(`节省: ${fmt(saved)} (${ratio}%)`);
+  lines.push(`节省 token: ${fmtTok(tokSaved)} (估算,压缩率 ${ratio}%)`);
+  lines.push(`  原始: ${fmtTok(tokOrig)} → 压缩后: ${fmtTok(tokComp)}`);
+  lines.push(`  原始字节: ${fmtBytes(totalOrig)} → ${fmtBytes(totalComp)}`);
   lines.push("");
 
   // 按类型
-  const byType: Record<string, { count: number; saved: number }> = {};
+  const byType: Record<string, { count: number; origBytes: number; compBytes: number }> = {};
   for (const m of metrics) {
-    const t = (m as any).content_type || "unknown";
-    if (!byType[t]) byType[t] = { count: 0, saved: 0 };
+    const r = m as any;
+    const t = r.content_type || "unknown";
+    if (!byType[t]) byType[t] = { count: 0, origBytes: 0, compBytes: 0 };
     byType[t].count++;
-    byType[t].saved += (m as any).original_size - (m as any).compressed_size;
+    byType[t].origBytes += r.original_size;
+    byType[t].compBytes += r.compressed_size;
   }
   lines.push("### 按内容类型");
-  for (const [t, v] of Object.entries(byType).sort((a, b) => b[1].saved - a[1].saved)) {
-    lines.push(`  ${t}: ${v.count} 条, 省 ${fmt(v.saved)}`);
+  for (const [t, v] of Object.entries(byType).sort((a, b) => (b[1].origBytes - b[1].compBytes) - (a[1].origBytes - a[1].compBytes))) {
+    const saved = v.origBytes - v.compBytes;
+    const p = v.origBytes > 0 ? ((saved / v.origBytes) * 100).toFixed(0) : "0";
+    lines.push(`  ${t}: ${v.count} 条, 省 ${fmtTok(estTokens(saved))} (${p}%)`);
   }
   lines.push("");
 
@@ -118,17 +131,16 @@ if (metrics.length === 0) {
     bySession[sid].comp += r.compressed_size;
     if (r.created_at > bySession[sid].latest) bySession[sid].latest = r.created_at;
   }
-  const sessions = Object.entries(bySession)
-    .sort((a, b) => b[1].latest - a[1].latest);
+  const sessions = Object.entries(bySession).sort((a, b) => b[1].latest - a[1].latest);
   if (sessions.length > 0) {
     lines.push("### 按会话");
     for (let i = 0; i < sessions.length; i++) {
       const [sid, v] = sessions[i];
-      const tag = sid.length > 12 ? sid.slice(0, 12) + "…" : sid;
+      const tag = sid.length > 16 ? sid.slice(0, 16) + "…" : sid;
       const saved = v.orig - v.comp;
-      const pct = v.orig > 0 ? ((saved / v.orig) * 100).toFixed(0) : "0";
+      const p = v.orig > 0 ? ((saved / v.orig) * 100).toFixed(0) : "0";
       const mark = i === 0 ? " ← 最近会话" : "";
-      lines.push(`  ${tag}: ${v.count} 条, 省 ${fmt(saved)} (${pct}%)${mark}`);
+      lines.push(`  ${tag}: ${v.count} 条, 省 ${fmtTok(estTokens(saved))} (${p}%)${mark}`);
     }
     lines.push("");
   }
@@ -137,9 +149,12 @@ if (metrics.length === 0) {
   lines.push("### 压缩记录 (最近 30 条)");
   for (const m of metrics.slice(0, 30)) {
     const r = m as any;
-    const pct = r.original_size > 0 ? ((1 - r.compressed_size / r.original_size) * 100).toFixed(0) : "0";
+    const tokO = estTokens(r.original_size);
+    const tokC = estTokens(r.compressed_size);
+    const tokS = tokO - tokC;
+    const p = r.original_size > 0 ? ((1 - r.compressed_size / r.original_size) * 100).toFixed(0) : "0";
     const ret = r.retrieved_count > 0 ? ` [取回${r.retrieved_count}]` : "";
-    lines.push(`  ${time(r.created_at)} ${r.tool} ${r.content_type} ${fmt(r.original_size)}→${fmt(r.compressed_size)} 省${pct}%${ret}`);
+    lines.push(`  ${time(r.created_at)} ${r.tool} ${r.content_type} 省${fmtTok(tokS)} (${p}%)${ret}`);
   }
 }
 
@@ -156,7 +171,7 @@ if (decisions.length > 0) {
   }
   lines.push("");
   for (const d of decisions.slice(-10).reverse()) {
-    lines.push(`  ${time(d.ts)} ${d.tool} ${d.type} conf=${d.confidence} ${fmt(d.size)}`);
+    lines.push(`  ${time(d.ts)} ${d.tool} ${d.type} conf=${d.confidence} ${fmtBytes(d.size)}`);
   }
 }
 
