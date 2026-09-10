@@ -6,9 +6,9 @@
  */
 
 import Database from "better-sqlite3";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 
 const DATA = join(homedir(), "Desktop", "frugal");
 const DB_PATH = join(DATA, "frugal.db");
@@ -66,11 +66,62 @@ function readMetrics(): any[] {
   }
 }
 
+// ─── JSONL token 统计 ──────────────────────────────────────────────────────
+interface ConvTokens {
+  file: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  turns: number;
+  mtime: number;
+}
+
+function scanJsonl(): ConvTokens[] {
+  const claudeDir = join(homedir(), ".claude", "projects");
+  if (!existsSync(claudeDir)) return [];
+  const results: ConvTokens[] = [];
+  function walk(dir: string) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!entry.name.endsWith(".jsonl")) continue;
+        try {
+          const st = statSync(full);
+          if (Date.now() - st.mtimeMs > 7 * 24 * 3600 * 1000) continue;
+          let input = 0, output = 0, cacheRead = 0, turns = 0;
+          for (const line of readFileSync(full, "utf-8").split("\n")) {
+            if (!line.trim()) continue;
+            try {
+              const d = JSON.parse(line);
+              if (d.type === "assistant") {
+                const u = d.message?.usage;
+                if (u?.input_tokens > 0) {
+                  turns++;
+                  input += u.input_tokens;
+                  output += u.output_tokens || 0;
+                  cacheRead += u.cache_read_input_tokens || 0;
+                }
+              }
+            } catch {}
+          }
+          if (turns > 0) results.push({ file: full, input, output, cacheRead, turns, mtime: st.mtimeMs });
+        } catch {}
+      }
+    } catch {}
+  }
+  walk(claudeDir);
+  return results.sort((a, b) => b.mtime - a.mtime);
+}
+
 const metrics = readMetrics();
 const decisions = readDecisions();
+const convs = scanJsonl();
 const lines: string[] = [];
 
+// ─── 压缩统计(DB) ─────────────────────────────────────────────────────────
 if (metrics.length === 0) {
+  lines.push("## 压缩记录");
   lines.push("尚无压缩记录。hook 触发后数据自动写入 DB。");
 } else {
   const totalOrig = metrics.reduce((s: number, m: any) => s + m.original_size, 0);
@@ -172,6 +223,29 @@ if (decisions.length > 0) {
   lines.push("");
   for (const d of decisions.slice(-10).reverse()) {
     lines.push(`  ${time(d.ts)} ${d.tool} ${d.type} conf=${d.confidence} ${fmtBytes(d.size)}`);
+  }
+}
+
+// ─── JSONL 对话级 token 统计(精确值) ───────────────────────────────────────
+if (convs.length > 0) {
+  lines.push("");
+  lines.push("## 对话 token 统计 (JSONL 精确值, 最近 7 天)");
+  lines.push("");
+
+  const totalInput = convs.reduce((s, c) => s + c.input, 0);
+  const totalOutput = convs.reduce((s, c) => s + c.output, 0);
+  const totalCache = convs.reduce((s, c) => s + c.cacheRead, 0);
+
+  lines.push(`对话数: ${convs.length}`);
+  lines.push(`input(新): ${fmtTok(totalInput)}  output: ${fmtTok(totalOutput)}  cache_read: ${fmtTok(totalCache)}`);
+  lines.push("");
+
+  // 最近 10 个对话明细
+  lines.push("### 对话明细 (最近 10 个)");
+  for (const c of convs.slice(0, 10)) {
+    const name = basename(c.file).replace(".jsonl", "").slice(0, 16);
+    // input = 新 token(全价), cache_read = 缓存命中(1/10 价), 两者独立不相加
+    lines.push(`  ${name}  ${c.turns}轮  新token:${fmtTok(c.input)}  缓存:${fmtTok(c.cacheRead)}  输出:${fmtTok(c.output)}`);
   }
 }
 
