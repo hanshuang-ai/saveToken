@@ -107,6 +107,32 @@ if (metrics.length === 0) {
   }
   lines.push("");
 
+  // 按会话
+  const bySession: Record<string, { count: number; orig: number; comp: number; latest: number }> = {};
+  for (const m of metrics) {
+    const r = m as any;
+    const sid = r.session_id || "(无会话)";
+    if (!bySession[sid]) bySession[sid] = { count: 0, orig: 0, comp: 0, latest: 0 };
+    bySession[sid].count++;
+    bySession[sid].orig += r.original_size;
+    bySession[sid].comp += r.compressed_size;
+    if (r.created_at > bySession[sid].latest) bySession[sid].latest = r.created_at;
+  }
+  const sessions = Object.entries(bySession)
+    .sort((a, b) => b[1].latest - a[1].latest);
+  if (sessions.length > 0) {
+    lines.push("### 按会话");
+    for (let i = 0; i < sessions.length; i++) {
+      const [sid, v] = sessions[i];
+      const tag = sid.length > 12 ? sid.slice(0, 12) + "…" : sid;
+      const saved = v.orig - v.comp;
+      const pct = v.orig > 0 ? ((saved / v.orig) * 100).toFixed(0) : "0";
+      const mark = i === 0 ? " ← 最近会话" : "";
+      lines.push(`  ${tag}: ${v.count} 条, 省 ${fmt(saved)} (${pct}%)${mark}`);
+    }
+    lines.push("");
+  }
+
   // 逐条明细
   lines.push("### 压缩记录 (最近 30 条)");
   for (const m of metrics.slice(0, 30)) {
