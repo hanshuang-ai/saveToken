@@ -20,14 +20,14 @@
 ## 安装(Claude Code 插件)
 
 ### 前置
-- [Bun](https://bun.sh)(运行时,内置 `bun:sqlite`):`curl -fsSL https://bun.sh/install | bash`
+- [Node.js](https://nodejs.org)(>=18,内置 npm)
 - Claude Code
 
 ### 步骤
 ```bash
 git clone https://github.com/hanshuang-ai/saveToken.git
 cd saveToken
-bun install          # 装 codegraph MCP 工具的依赖(核心压缩不装也能跑)
+npm install          # 装依赖(better-sqlite3 + tree-sitter + MCP SDK)
 ```
 在 Claude Code 里:
 ```
@@ -36,10 +36,10 @@ bun install          # 装 codegraph MCP 工具的依赖(核心压缩不装也�
 ```
 重启会话即生效。
 
-> 用目录 marketplace 是因为:插件 MCP server 依赖 `@modelcontextprotocol/sdk`,Claude Code 的 git marketplace 不会自动 `bun install`(plugin.json 无 postinstall 字段——官方规范尚未支持)。目录源直接跑源码仓库,依赖从仓库 `node_modules` 解析;改代码后 `git pull` 即生效,无需同步缓存。
+> 用目录 marketplace 是因为:插件 MCP server 依赖 `@modelcontextprotocol/sdk` 等包,Claude Code 的 git marketplace 不会自动 `npm install`(plugin.json 无 postinstall 字段——官方规范尚未支持)。目录源直接跑源码仓库,依赖从仓库 `node_modules` 解析;改代码后 `git pull` 即生效,无需同步缓存。
 
 ### 降级
-即使跳过 `bun install`,核心 token 节省(hook 压缩 + digest)照常工作——核心压缩链路零外部依赖(仅 `bun:sqlite` 内置)。只有 codegraph 的 `tok_code_symbol`/`tok_code_refs` 需要 tree-sitter 依赖。
+即使跳过 `npm install`,核心 token 节省(hook 压缩 + digest)照常工作——核心压缩链路零外部依赖(仅 `better-sqlite3` 内置)。只有 codegraph 的 `tok_code_symbol`/`tok_code_refs` 需要 tree-sitter 依赖。
 
 ## MCP 工具
 
@@ -51,7 +51,7 @@ bun install          # 装 codegraph MCP 工具的依赖(核心压缩不装也�
 
 ## 测试
 ```bash
-bun test          # 55 pass(bunfig root=tests,排除 corpus 自带测试)
+npm test          # 运行测试套件
 ```
 
 ## 语料与测量

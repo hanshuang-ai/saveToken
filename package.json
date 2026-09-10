@@ -4,14 +4,18 @@
   "description": "通用 token 节省插件 —— 内容感知核心 + 可插拔适配器",
   "type": "module",
   "scripts": {
-    "diagnose": "bun run src/diagnose.ts",
-    "test": "bun test tests/"
+    "diagnose": "npx tsx src/diagnose.ts",
+    "test": "npx tsx --test tests/**/*.test.ts"
   },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "better-sqlite3": "^11.0.0",
     "tree-sitter-javascript": "^0.25.0",
     "tree-sitter-typescript": "^0.23.2",
     "web-tree-sitter": "^0.27.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
   }
 }

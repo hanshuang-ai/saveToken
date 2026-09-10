@@ -7,9 +7,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bun",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-compress.ts"],
-            "timeout": 10
+            "command": "npx",
+            "args": ["tsx", "${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-compress.ts"],
+            "timeout": 30
           }
         ]
       }

@@ -8,8 +8,8 @@
   "keywords": ["token", "efficiency", "context", "compression"],
   "mcpServers": {
     "frugal": {
-      "command": "bun",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/src/mcp/server.ts"]
+      "command": "npx",
+      "args": ["tsx", "${CLAUDE_PLUGIN_ROOT}/src/mcp/server.ts"]
     }
   }
 }

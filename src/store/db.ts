@@ -17,11 +17,13 @@
  *   store.recordMetric({ ... });
  */
 
-import { Database } from "bun:sqlite";
+import Database from "better-sqlite3";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const SCHEMA_PATH = join(import.meta.dir, "schema.sql");
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SCHEMA_PATH = join(__dirname, "schema.sql");
 
 /** 原文备份:返回的句柄用于取回 */
 export interface OriginalRecord {
@@ -162,7 +164,7 @@ class Store {
     if (path) {
       const dir = dirname(path);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      this.db = new Database(path, { create: true });
+      this.db = new Database(path);
       this.dbPath = path;
     } else {
       this.db = new Database(":memory:");

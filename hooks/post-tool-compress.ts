@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * post-tool-compress.ts —— PostToolUse hook(核心接线)
  *
@@ -30,9 +29,9 @@ import { compress } from "../src/compress";
 import { store } from "../src/store/db";
 import { decisionLog } from "../src/core/decision-log";
 import { langForExt } from "../src/codegraph/languages";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 
 // ─── 配置 ──────────────────────────────────────────────────────────────────
 
@@ -42,25 +41,19 @@ const WHITELIST = new Set(["Bash", "Read"]);
 /** 触发压缩的最小字符数(单字段)。小于此不碰,避免开销 */
 const MIN_CHARS = 2048;
 
-/** 数据库与决策日志路径:优先插件数据目录,回退插件根下 .data,再回退临时目录 */
-function dataDir(): string {
-  const root = process.env.CLAUDE_PLUGIN_ROOT;
-  const pluginData = process.env.CLAUDE_PLUGIN_DATA;
-  if (pluginData) return pluginData;
-  if (root) return join(root, ".data");
-  return join(tmpdir(), "frugal");
-}
-const DATA = dataDir();
+/** 数据库与决策日志路径:桌面/frugal(用户可见,跨平台一致) */
+const DATA = join(homedir(), "Desktop", "frugal");
 const DB_PATH = join(DATA, "frugal.db");
 const DECISION_LOG = join(DATA, "hook-decisions.jsonl");
 
 // ─── 初始化(每次 hook 调用都是新进程,需重新打开) ──────────────────────────
+// 确保数据目录存在
+try { mkdirSync(DATA, { recursive: true }); } catch { /* ignore */ }
 
 let storeOpened = false;
 function ensureStore(): void {
   if (storeOpened) return;
   try {
-    if (!existsSync(DATA)) mkdirSync(DATA, { recursive: true });
     store.open(DB_PATH);
     storeOpened = true;
   } catch {
@@ -68,15 +61,8 @@ function ensureStore(): void {
   }
 }
 
-function ensureDecisionLog(): void {
-  if (decisionLog.isEnabled()) return;
-  try {
-    if (!existsSync(DATA)) mkdirSync(DATA, { recursive: true });
-    decisionLog.enable(DECISION_LOG);
-  } catch {
-    // 日志开不了不影响主流程
-  }
-}
+// 决策日志默认开启:每次分类决策记一行 JSONL,便于回溯分类规则效果
+try { decisionLog.enable(DECISION_LOG); } catch { /* ignore */ }
 
 // ─── 核心:压缩单个字符串字段 ────────────────────────────────────────────────
 
@@ -206,7 +192,7 @@ async function main(): Promise<void> {
   // 读 stdin
   let raw: string;
   try {
-    raw = await Bun.stdin.text();
+    raw = readFileSync(0, "utf-8");
   } catch {
     return; // 读不到 stdin,放行
   }
@@ -235,7 +221,6 @@ async function main(): Promise<void> {
     typeof data.session_id === "string" ? data.session_id : undefined;
 
   const now = Date.now();
-  ensureDecisionLog();
 
   let rewritten: { changed: boolean; value: unknown };
   try {

@@ -20,20 +20,13 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { store } from "../store/db";
 import { retrieveSymbol, retrieveRefs } from "../codegraph/graph";
 
 // ─── 数据目录与 store 初始化 ──────────────────────────────────────────────────
 // 与 hook 脚本用同一份数据库,故路径逻辑保持一致。
-function dataDir(): string {
-  const pluginData = process.env.CLAUDE_PLUGIN_DATA;
-  if (pluginData) return pluginData;
-  const root = process.env.CLAUDE_PLUGIN_ROOT;
-  if (root) return join(root, ".data");
-  return join(tmpdir(), "frugal");
-}
-const DATA = dataDir();
+const DATA = join(homedir(), "Desktop", "frugal");
 const DB_PATH = join(DATA, "frugal.db");
 
 try {
