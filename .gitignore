@@ -68,3 +68,8 @@ ehthumbs.db
 Thumbs.db
 # 真实测试语料(大文件,不入库)
 corpus/
+
+# A/B测试相关
+prompts/
+results/
+*.sh
