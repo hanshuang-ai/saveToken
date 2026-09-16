@@ -51,6 +51,7 @@ coverage/
 
 # Claude internal state
 .claude/
+.workbuddy/
 
 # Temporary files
 tmp/

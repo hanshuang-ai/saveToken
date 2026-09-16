@@ -9,6 +9,8 @@ export type ContentType = "structured" | "prose" | "mixed" | "empty";
 
 /** 压缩结果 */
 export interface Compressed {
+  /** In-process exact restore only. Never include this field in model output. */
+  restoreText?: string;
   /** 压缩后的文本,送进上下文 */
   text: string;
   /** 该次压缩是否实际发生(未达阈值时 text===原文,compressed=false) */

@@ -50,6 +50,13 @@ const STRUCTURED_TOOLS = new Set(["Bash", "Read", "Grep", "Glob"]);
 
 const ANSI_RE =
   /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]/g;
+const MACHINE_SNAPSHOT_MARKERS = [
+  /^\s*Tasks:\s+\d+\s+total\b/m,
+  /^\s*Mem:\s+\d+\w+/m,
+  /^\s*Swap:\s+\d+\w+/m,
+  /^\s*PID\s+USER\b/m,
+  /^\s*PSS\(kB\)\s+Process Name\b/m,
+];
 
 /**
  * 二进制内容检测。
@@ -141,6 +148,19 @@ export function classify(input: ClassifyInput): ClassifyResult {
     return r;
   }
 
+  // Shell-collected CPU/memory snapshots are machine tables, even though
+  // English column names can look like prose to the generic heuristic.
+  const machineSnapshotHits = MACHINE_SNAPSHOT_MARKERS.filter((pattern) => pattern.test(text)).length;
+  if (machineSnapshotHits >= 2) {
+    const r = {
+      type: "structured" as ContentType,
+      confidence: 0.95,
+      signals: ["machine-snapshot"],
+    };
+    decisionLog.record(text, r, { path: input.path, tool }, Date.now());
+    return r;
+  }
+
   const lines = text.split("\n");
   const nonEmpty = lines.filter((l) => l.trim().length > 0);
   const lineCount = nonEmpty.length;
@@ -169,6 +189,7 @@ export function classify(input: ClassifyInput): ClassifyResult {
   if (markupRatio > 1) signals.push("markup-tag");
 
   // 信号 4:ANSI 码
+  ANSI_RE.lastIndex = 0;
   const hasAnsi = ANSI_RE.test(text);
   if (hasAnsi) signals.push("ansi");
 

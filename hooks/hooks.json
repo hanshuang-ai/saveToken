@@ -1,5 +1,5 @@
 {
-  "description": "frugal PostToolUse:工具输出分类→无损压缩→updatedToolOutput 替换为压缩版",
+  "description": "frugal: conservative Bash/Read output views with committed original retrieval",
   "hooks": {
     "PostToolUse": [
       {
@@ -7,8 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npx",
-            "args": ["tsx", "${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-compress.ts"],
+            "command": "npx --prefix \"${CLAUDE_PLUGIN_ROOT}\" --no-install tsx \"${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-compress.ts\"",
             "timeout": 30
           }
         ]

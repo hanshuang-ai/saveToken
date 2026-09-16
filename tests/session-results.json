@@ -1,0 +1,40 @@
+{
+  "scenario-1-日志分析": {
+    "name": "日志分析",
+    "control": [
+      {
+        "sessionId": "d5b52b47-9ef6-4c9b-857d-1884f85a2c38",
+        "jsonlPath": "C:\\Users\\WTCL\\.claude\\projects\\E--WT-saveToken\\d5b52b47-9ef6-4c9b-857d-1884f85a2c38.jsonl",
+        "jsonlSize": 23936,
+        "startedAt": "2026-09-14T10:21:27.245Z"
+      }
+    ],
+    "experiment": [
+      {
+        "sessionId": "b81049b3-4ea8-48c2-b981-7b951fb1d92d",
+        "jsonlPath": "C:\\Users\\WTCL\\.claude\\projects\\E--WT-saveToken\\b81049b3-4ea8-48c2-b981-7b951fb1d92d.jsonl",
+        "jsonlSize": 46059,
+        "startedAt": "2026-09-14T10:22:02.977Z"
+      }
+    ]
+  },
+  "scenario-2-代码优化": {
+    "name": "代码优化",
+    "control": [
+      {
+        "sessionId": "824a720d-9dd0-4e2b-8b4c-d76120bce0c1",
+        "jsonlPath": "C:\\Users\\WTCL\\.claude\\projects\\E--WT-saveToken\\824a720d-9dd0-4e2b-8b4c-d76120bce0c1.jsonl",
+        "jsonlSize": 12938,
+        "startedAt": "2026-09-14T10:22:57.908Z"
+      }
+    ],
+    "experiment": [
+      {
+        "sessionId": "86cbe738-d951-4485-907e-469a2b6bce2d",
+        "jsonlPath": "C:\\Users\\WTCL\\.claude\\projects\\E--WT-saveToken\\86cbe738-d951-4485-907e-469a2b6bce2d.jsonl",
+        "jsonlSize": 13519,
+        "startedAt": "2026-09-14T10:23:10.109Z"
+      }
+    ]
+  }
+}

@@ -1,251 +1,197 @@
-/**
- * post-tool-compress.ts —— PostToolUse hook(核心接线)
- *
- * 链路:工具输出 → 白名单 → 阈值 → 分类 → 无损压缩 → 原文存 SQLite →
- *       updatedToolOutput 返回压缩版 → 记度量
- *
- * 契约(官方文档 code.claude.com/docs/en/hooks,已实测确认):
- *   输入 stdin JSON: { tool_name, tool_input, tool_response, cwd, session_id, ... }
- *   输出 stdout JSON: {
- *     hookSpecificOutput: {
- *       hookEventName: "PostToolUse",
- *       updatedToolOutput: <形状同原 tool_response,仅字符串字段被压缩>
- *     }
- *   }
- *   updatedToolOutput 在工具输出发送给模型之前替换它(工具副作用已发生,只改模型看到的)。
- *
- * 适配策略:递归遍历 tool_response,只压缩"长字符串"字段,结构原样保留 →
- *          形状自动匹配任何工具(Bash{stdout,stderr,...} / Read{...} / ...),无需逐工具硬编码。
- *
- * 安全(绝不破坏工具输出):
- *   - 散文一律放行(分类器安全侧)
- *   - 小于阈值不碰
- *   - 任何异常 → exit 0 原样放行,不输出 JSON
- *   - 原文永远备份在 SQLite,handle 可经 tok_retrieve 取回(安全模型第三道闸门)
- */
-
-import { classify } from "../src/core/classifier";
-import { compress } from "../src/compress";
-import { store } from "../src/store/db";
-import { decisionLog } from "../src/core/decision-log";
-import { langForExt } from "../src/codegraph/languages";
-import { mkdirSync, existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+/** Conservative PostToolUse adapter. No host-history mutation or blind snipping. */
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { performance } from "node:perf_hooks";
+import { planOutput, type OutputMeta } from "../src/core/tool-output";
+import type { MetricInput } from "../src/store/db";
 
-// ─── 配置 ──────────────────────────────────────────────────────────────────
+type Persist = (original: string, metric: MetricInput & { handle: string }) =>
+  Promise<Record<string, number>> | Record<string, number>;
 
-/** 拦截的工具白名单(覆盖 80%+ 浪费,见设计文档五·甲) */
-const WHITELIST = new Set(["Bash", "Read"]);
-
-/** 触发压缩的最小字符数(单字段)。小于此不碰,避免开销 */
-const MIN_CHARS = 2048;
-
-/** 数据库与决策日志路径:桌面/frugal(用户可见,跨平台一致) */
-const DATA = join(homedir(), "Desktop", "frugal");
-const DB_PATH = join(DATA, "frugal.db");
-const DECISION_LOG = join(DATA, "hook-decisions.jsonl");
-
-// ─── 初始化(每次 hook 调用都是新进程,需重新打开) ──────────────────────────
-// 确保数据目录存在
-try { mkdirSync(DATA, { recursive: true }); } catch { /* ignore */ }
-
-let storeOpened = false;
-function ensureStore(): void {
-  if (storeOpened) return;
-  try {
-    store.open(DB_PATH);
-    storeOpened = true;
-  } catch {
-    // store 打不开不阻塞压缩(压缩仍可走内存回退,只是失去持久备份/检索)
-  }
+interface TextField {
+  field: string;
+  text: string;
+  source?: string;
+  replace(value: unknown, next: string): unknown;
 }
 
-// 决策日志默认开启:每次分类决策记一行 JSONL,便于回溯分类规则效果
-try { decisionLog.enable(DECISION_LOG); } catch { /* ignore */ }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 
-// ─── 核心:压缩单个字符串字段 ────────────────────────────────────────────────
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
 
-/**
- * 对一个字符串字段做 分类→压缩→存备份→记度量。
- * @returns { changed, value } changed=true 时 value 为压缩版(末尾附原文 handle)
- */
-function compressStringField(
-  text: string,
-  tool: string,
-  path: string | undefined,
-  sessionId: string | undefined,
-  now: number
-): { changed: boolean; value: string } {
-  if (text.length < MIN_CHARS) {
-    return { changed: false, value: text };
+function readSourceFrom(response: unknown, fallback?: string): string | undefined {
+  if (!isRecord(response)) return fallback;
+  const file = isRecord(response.file) ? response.file : undefined;
+  return firstString(
+    response.file_path,
+    response.filePath,
+    response.path,
+    file?.file_path,
+    file?.filePath,
+    file?.path,
+    fallback
+  );
+}
+
+function extractTextFields(response: unknown, tool: string, fallbackSource?: string): TextField[] {
+  if (typeof response === "string") {
+    return [{
+      field: "text",
+      text: response,
+      source: fallbackSource,
+      replace: (_value, next) => next,
+    }];
+  }
+  if (!isRecord(response)) return [];
+
+  if (tool === "Bash") {
+    return Object.entries(response)
+      .filter((entry): entry is [string, string] =>
+        ["stdout", "stderr"].includes(entry[0]) && typeof entry[1] === "string")
+      .map(([field, text]) => ({
+        field,
+        text,
+        source: fallbackSource,
+        replace: (value: unknown, next: string) => ({ ...(value as object), [field]: next }),
+      }));
   }
 
-  const cls = classify({ text, tool, path });
+  if (tool !== "Read") return [];
 
-  // 散文与 mixed 一律放行(安全侧:绝不压叙事)。
-  // mixed 含散文部分,实测 format-strip ROI 仅 3-11%,却照常分类/存原文/记 metrics
-  // 产生噪音,不值得为这点收益冒险触碰叙事部分 → 与 prose 同等放行。
-  if (cls.type === "prose" || cls.type === "mixed" || cls.type === "empty") {
-    return { changed: false, value: text };
-  }
-
-  // structured:format-strip + snip(头尾截断)。
-  // 省 token 大头靠 snip。dedup 原语已移除:在"存原文+store 取回"架构下其可逆性
-  // 是死路径(模型取回走 store 不走 decompress),退化成有损缩写且把路径压成 @n
-  // 伤可读性,实测收益仅 ~8% 且 74% 集中在单条日志。详见设计文档。
-  const result = compress(text);
-
-  if (!result.compressed) {
-    return { changed: false, value: text };
-  }
-
-  // 存完整原文(安全模型第三道闸门:handle 可取回原文)
-  let handle = "";
-  try {
-    ensureStore();
-    if (storeOpened) {
-      handle = store.saveOriginal(text, { source: path, tool }, now);
-      store.recordMetric({
-        handle,
-        source: path,
-        tool,
-        contentType: cls.type,
-        originalSize: result.originalSize,
-        compressedSize: result.compressedSize,
-        method: result.steps.map((s) => s.method).join(","),
-        sessionId,
-        createdAt: now,
+  const fields: TextField[] = [];
+  const source = readSourceFrom(response, fallbackSource);
+  for (const field of ["content", "text"] as const) {
+    if (typeof response[field] === "string") {
+      fields.push({
+        field,
+        text: response[field],
+        source,
+        replace: (value: unknown, next: string) => ({ ...(value as object), [field]: next }),
       });
     }
-  } catch {
-    // 存储失败不阻塞压缩流程
   }
-
-  // 末尾附原文 handle + 检索引导:引导模型按需取片段/按行,而非倾倒全文。
-  // orig-N 是完整原文(FTS5 按原文行号建索引,startLine 正确);snip-(省略标记里)
-  // 是被截中间段,其索引按中间段内行号建,与原文行号错配 → 优先用 orig-N,
-  // 避免混用 snip- 的 startLine 拿到错位行。
-  // 统计型与压缩根本矛盾(全表分析需全数据在上下文)→ 引导计算下推(Bash 处理源文件)。
-  // 行数用压缩前的 text 算(compress 后 result.text 行数已变,不能用来报"共X行")。
-  const totalLines = text.split("\n").length;
-  const sourceTag = path ? `,来源:${path}` : "";
-  const statHint = path
-    ? `统计/聚合全表:用 Bash 处理源文件(如 awk/python ${path}),勿取回全文(耗token)。`
-    : `统计/聚合全表:重新用 Bash 跑统计命令(如 awk),勿取回全文(耗token)。`;
-  // 代码(TS/JS)走 AST 检索引导:tok_code_symbol/tok_code_refs 比扁平 FTS5 检索更准
-  // (能跨文件解析调用关系)。hook 只判扩展名(langForExt 纯数据,不背 tree-sitter 依赖);
-  // AST 解析在 MCP server 懒做(首次查某 handle 时 parse+存表,后续查表)。
-  const ext = (() => {
-    if (!path) return "";
-    const d = path.lastIndexOf(".");
-    const s = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-    return d > s ? path.slice(d + 1).toLowerCase() : "";
-  })();
-  const isCode = !!langForExt(ext);
-  const note = handle
-    ? isCode
-      ? `\n\n「frugal:原文已存,handle=${handle}(代码,共${totalLines}行${sourceTag})。省略标记里的 snip- 是截断中间段,查符号用 ${handle}(完整原文)。\n查函数/类完整实现:tok_code_symbol(handle="${handle}", symbol="函数名")。\n查调用关系(跨文件,谁调用/调用了谁):tok_code_refs(handle="${handle}", symbol="函数名", direction="callees")。\n查特定行:tok_retrieve(handle="${handle}", startLine=N, count=M)。\n勿取回全文(耗token)。」`
-      : `\n\n「frugal:原文已存,handle=${handle}(完整原文,共${totalLines}行${sourceTag})。省略标记是压缩视图(中间段或结构化摘要),${handle} 已含全文,优先用 ${handle}。\n查特定数据:tok_retrieve(handle="${handle}", query="关键词") 检索片段(约20行上下文),或 tok_retrieve(handle="${handle}", startLine=N, count=M) 按行取。\n${statHint}」`
-    : "";
-  return { changed: true, value: result.text + note };
-}
-
-// ─── 递归遍历 tool_response,压缩所有长字符串字段 ────────────────────────────
-
-function rewriteToolResponse(
-  node: unknown,
-  tool: string,
-  path: string | undefined,
-  sessionId: string | undefined,
-  now: number
-): { changed: boolean; value: unknown } {
-  if (typeof node === "string") {
-    return compressStringField(node, tool, path, sessionId, now);
-  }
-  if (Array.isArray(node)) {
-    let changed = false;
-    const value = node.map((item) => {
-      const r = rewriteToolResponse(item, tool, path, sessionId, now);
-      if (r.changed) changed = true;
-      return r.value;
+  if (isRecord(response.file) && typeof response.file.content === "string") {
+    fields.push({
+      field: "file.content",
+      text: response.file.content,
+      source,
+      replace: (value: unknown, next: string) => {
+        const current = isRecord(value) ? value : {};
+        const file = isRecord(current.file) ? current.file : {};
+        return { ...current, file: { ...file, content: next } };
+      },
     });
-    return { changed, value };
   }
-  if (node && typeof node === "object") {
-    let changed = false;
-    const value: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      const r = rewriteToolResponse(v, tool, path, sessionId, now);
-      if (r.changed) changed = true;
-      value[k] = r.value;
+  return fields;
+}
+
+/** Bash and Read text fields are eligible. Images and metadata stay intact. */
+export async function rewriteToolResponse(response: unknown, meta: OutputMeta, persist: Persist) {
+  let value = response;
+  let changed = false;
+  const measurements: Record<string, unknown>[] = [];
+  const fields = extractTextFields(response, meta.tool, meta.source);
+
+  for (const candidateField of fields) {
+    const { field, text: original } = candidateField;
+    const start = performance.now();
+    const measurement: Record<string, unknown> = { field, originalSize: original.length };
+    try {
+      const fieldMeta = { ...meta, source: candidateField.source ?? meta.source, field };
+      const plan = planOutput(original, fieldMeta);
+      Object.assign(measurement, plan.timings, { reason: plan.reason, emittedSize: original.length });
+      if (!plan.candidate) continue;
+      const candidate = plan.candidate;
+      const storeStart = performance.now();
+      const phases = await persist(original, {
+        handle: candidate.handle, source: fieldMeta.source, tool: meta.tool,
+        sessionId: meta.sessionId, contentType: candidate.contentType,
+        originalSize: original.length, compressedSize: candidate.text.length,
+        method: candidate.method, createdAt: Date.now(),
+      });
+      Object.assign(measurement, phases, {
+        persistenceMs: performance.now() - storeStart,
+        reason: "adopted", emittedSize: candidate.text.length,
+      });
+      // No candidate is exposed until its backup/index/metric transaction commits.
+      value = candidateField.replace(value, candidate.text);
+      changed = true;
+    } catch {
+      measurement.reason = "failed-open";
+      measurement.emittedSize = original.length;
+    } finally {
+      measurement.totalMs = performance.now() - start;
+      measurements.push(measurement);
     }
-    return { changed, value };
   }
-  // 数字/布尔/null 原样
-  return { changed: false, value: node };
+  return { value, changed, measurements };
 }
 
-// ─── 主流程 ──────────────────────────────────────────────────────────────────
-
-async function main(): Promise<void> {
-  // 读 stdin
-  let raw: string;
+async function main() {
+  const moduleReadyMs = performance.now();
+  const started = performance.now();
+  let opened: typeof import("../src/store/db").store | undefined;
   try {
-    raw = readFileSync(0, "utf-8");
+    const data = JSON.parse(readFileSync(0, "utf8"));
+    const tool = data.tool_name ?? data.toolName;
+    if (tool !== "Bash" && tool !== "Read") return;
+    const response = data.tool_response ?? data.toolResponse;
+    if (response == null) return;
+    const toolInput = data.tool_input ?? data.toolInput;
+    const readSource = tool === "Read"
+      ? firstString(
+        isRecord(toolInput) ? toolInput.file_path : undefined,
+        isRecord(toolInput) ? toolInput.filePath : undefined,
+        readSourceFrom(response)
+      )
+      : undefined;
+    const meta: OutputMeta = {
+      tool,
+      source: readSource ?? (typeof data.cwd === "string" ? data.cwd : undefined),
+      sessionId: typeof data.session_id === "string" ? data.session_id : undefined,
+    };
+    const rewritten = await rewriteToolResponse(response, meta, async (original, metric) => {
+      const openStart = performance.now();
+      if (!opened) {
+        const { store } = await import("../src/store/db");
+        store.open(join(process.env.FRUGAL_DATA_DIR ?? join(homedir(), "Desktop", "frugal"), "frugal.db"));
+        opened = store;
+      }
+      const openMs = performance.now() - openStart;
+      return { openMs, ...opened.saveOutput(original, metric) };
+    });
+    if (rewritten.changed) {
+      console.log(JSON.stringify({ hookSpecificOutput: {
+        hookEventName: "PostToolUse", updatedToolOutput: rewritten.value,
+      } }));
+    }
+    // Explicit opt-in; never log source content or let telemetry affect results.
+    const timingLog = process.env.FRUGAL_TIMING_LOG;
+    if (timingLog) {
+      try {
+        mkdirSync(dirname(timingLog), { recursive: true });
+        appendFileSync(timingLog, JSON.stringify({
+          sessionId: meta.sessionId, tool, moduleReadyMs,
+          totalMs: performance.now() - started, fields: rewritten.measurements,
+        }) + "\n", "utf8");
+      } catch { /* telemetry is best effort */ }
+    }
   } catch {
-    return; // 读不到 stdin,放行
-  }
-  if (!raw.trim()) return;
-
-  let data: any;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    return; // 非 JSON,放行
-  }
-
-  const toolName: string = data.tool_name ?? data.toolName ?? "";
-  if (!WHITELIST.has(toolName)) return; // 不在白名单,放行
-
-  const toolResponse = data.tool_response ?? data.toolResponse;
-  if (toolResponse == null) return; // 无输出,放行
-
-  // 来源路径(Read 的 file_path;Bash 无路径,走内容启发式)
-  const toolInput = data.tool_input ?? data.toolInput ?? {};
-  const path: string | undefined =
-    typeof toolInput.file_path === "string" ? toolInput.file_path : undefined;
-
-  // 会话 ID(用于会话级统计;PostToolUse payload 标准字段)
-  const sessionId: string | undefined =
-    typeof data.session_id === "string" ? data.session_id : undefined;
-
-  const now = Date.now();
-
-  let rewritten: { changed: boolean; value: unknown };
-  try {
-    rewritten = rewriteToolResponse(toolResponse, toolName, path, sessionId, now);
-  } catch {
-    return; // 压缩过程异常,放行(绝不破坏工具输出)
-  }
-
-  if (!rewritten.changed) return; // 没压缩(都太小/都散文),放行
-
-  // 用 updatedToolOutput 返回压缩版(形状自动匹配,因为是同结构改字符串)
-  const output = {
-    hookSpecificOutput: {
-      hookEventName: "PostToolUse",
-      updatedToolOutput: rewritten.value,
-    },
-  };
-  console.log(JSON.stringify(output));
-
-  // 关闭 store,确保 WAL 落盘
-  try {
-    if (storeOpened) store.close();
-  } catch {
-    // ignore
+    // Malformed input, parser errors and storage failures leave host output intact.
+  } finally {
+    opened?.close();
   }
 }
 
-main();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}

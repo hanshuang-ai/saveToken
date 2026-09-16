@@ -18,6 +18,7 @@
  */
 
 import Database from "better-sqlite3";
+import { performance } from "node:perf_hooks";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -156,58 +157,160 @@ export interface MetricRecord {
 }
 
 class Store {
-  private db: Database | null = null;
+  private _db: Database.Database | null = null;
   private dbPath = "";
 
   /** 打开/创建数据库。path 为空则用内存库(测试用)。 */
   open(path?: string): void {
+    this.close();
+    try {
     if (path) {
       const dir = dirname(path);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      this.db = new Database(path);
+      this._db = new Database(path);
       this.dbPath = path;
     } else {
-      this.db = new Database(":memory:");
+      this._db = new Database(":memory:");
       this.dbPath = ":memory:";
     }
-    this.db.exec("PRAGMA journal_mode = WAL;");
-    this.db.exec("PRAGMA foreign_keys = ON;");
+    this._db.exec("PRAGMA journal_mode = WAL;");
+    this._db.exec("PRAGMA foreign_keys = ON;");
     this.initSchema();
+    } catch (error) {
+      this.close();
+      throw error;
+    }
   }
 
   /** 初始化表结构 */
   private initSchema(): void {
     const schema = readFileSync(SCHEMA_PATH, "utf-8");
-    this.db!.exec(schema);
+    this._db!.exec(schema);
     // 迁移:旧库的 metrics 没有 session_id 列(schema.sql 用 CREATE TABLE IF NOT EXISTS,
     // 旧库不会自动加列)。检测缺失则补列,实现跨版本升级。
-    const cols = this.db!.prepare("PRAGMA table_info(metrics)").all() as { name: string }[];
+    const cols = this._db!.prepare("PRAGMA table_info(metrics)").all() as { name: string }[];
     if (cols.length > 0 && !cols.some((c) => c.name === "session_id")) {
-      this.db!.exec("ALTER TABLE metrics ADD COLUMN session_id TEXT");
+      this._db!.exec("ALTER TABLE metrics ADD COLUMN session_id TEXT");
     }
     // session_id 索引在迁移加列之后建:旧库此时才有该列。若放 schema.sql,
     // 旧库 exec(schema) 时列还不存在,建索引会报 "no such column" 使 initSchema 整个失败。
-    this.db!.exec("CREATE INDEX IF NOT EXISTS idx_metrics_session ON metrics(session_id)");
+    this._db!.exec("CREATE INDEX IF NOT EXISTS idx_metrics_session ON metrics(session_id)");
   }
 
   close(): void {
-    if (this.db) {
-      this.db.close();
-      this.db = null;
+    if (this._db) {
+      this._db.close();
+      this._db = null;
     }
   }
 
   get isOpen(): boolean {
-    return this.db !== null;
+    return this._db !== null;
   }
 
   get path(): string {
     return this.dbPath;
   }
 
-  private ensureOpen(): Database {
-    if (!this.db) throw new Error("Store 未打开,请先调用 store.open()");
-    return this.db;
+  private ensureOpen(): Database.Database {
+    if (!this._db) throw new Error("Store 未打开,请先调用 store.open()");
+    return this._db;
+  }
+
+  // ─── 时间淘汰 ────────────────────────────────────────────────────────────
+
+  /**
+    * Explicit maintenance only. Retention is unrelated to provider prompt-cache
+    * TTL. Never call this automatically when opening a user's database.
+   */
+  cleanupOldRecords(ttlMs = 86400000): number {
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error("Invalid retention period");
+    const db = this.ensureOpen();
+    const cutoff = Date.now() - ttlMs;
+    const delOriginals = db.prepare("DELETE FROM originals WHERE created_at < ?");
+    const delFts = db.prepare("DELETE FROM docs_fts WHERE handle NOT IN (SELECT handle FROM originals)");
+    const delMetrics = db.prepare("DELETE FROM metrics WHERE created_at < ?");
+    let total = 0;
+    db.exec("BEGIN");
+    try {
+      db.prepare("DELETE FROM symbols WHERE handle IN (SELECT handle FROM originals WHERE created_at < ?)").run(cutoff);
+      db.prepare("DELETE FROM refs WHERE from_handle IN (SELECT handle FROM originals WHERE created_at < ?) OR to_handle IN (SELECT handle FROM originals WHERE created_at < ?)").run(cutoff, cutoff);
+      const r1 = delOriginals.run(cutoff);
+      total += r1.changes;
+      const r2 = delFts.run();
+      total += r2.changes;
+      const r3 = delMetrics.run(cutoff);
+      total += r3.changes;
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+    return total;
+  }
+
+  // ─── 压缩质量分析(过压缩检测)─────────────────────────────────────────────
+
+  /** 单 handle 取回统计(供过压缩检测用) */
+  getHandleRetrieveStats(handle: string): {
+    retrievedCount: number;
+    compressed: boolean;
+    savedPct: number;
+    createdAt: number;
+  } | null {
+    const db = this.ensureOpen();
+    const row = db
+      .prepare(
+        "SELECT retrieved_count, original_size, compressed_size, created_at FROM metrics WHERE handle = ? AND method NOT LIKE '%dedup%'"
+      )
+      .get(handle) as {
+      retrieved_count: number;
+      original_size: number;
+      compressed_size: number;
+      created_at: number;
+    } | null;
+    if (!row) return null;
+    const orig = row.original_size ?? 0;
+    const comp = row.compressed_size ?? 0;
+    return {
+      retrievedCount: row.retrieved_count ?? 0,
+      compressed: comp < orig,
+      savedPct: orig > 0 ? Math.round((1 - comp / orig) * 100) : 0,
+      createdAt: row.created_at,
+    };
+  }
+
+  /**
+   * 全局取回率:被取回的压缩记录占比。
+   * 取回率高(>30%)=压缩太激进,应考虑调高阈值或对某些类型降级。
+   */
+  getRetrieveRate(): { rate: number; retrieved: number; compressed: number; highRetrieves: string[] } {
+    const db = this.ensureOpen();
+    const rows = db
+      .prepare(
+        `SELECT handle, retrieved_count, original_size, compressed_size
+         FROM metrics
+         WHERE method NOT LIKE '%dedup%' AND original_size > compressed_size`
+      )
+      .all() as {
+      handle: string;
+      retrieved_count: number;
+      original_size: number;
+      compressed_size: number;
+    }[];
+    const compressed = rows.length;
+    let retrieved = 0;
+    const highRetrieves: string[] = [];
+    for (const r of rows) {
+      if (r.retrieved_count > 0) retrieved++;
+      if (r.retrieved_count >= 2) highRetrieves.push(r.handle);
+    }
+    return {
+      rate: compressed > 0 ? retrieved / compressed : 0,
+      retrieved,
+      compressed,
+      highRetrieves,
+    };
   }
 
   // ─── 原文备份 ────────────────────────────────────────────────────────────
@@ -226,27 +329,50 @@ class Store {
 
   /**
    * 存原文,用指定的 handle(snip 等需要固定 handle 的场景)。
-   * handle 已存在则覆盖(同 handle 重复存视为更新)。
+   * Existing identical records are reused. Conflicting content/provenance is rejected.
    */
   saveOriginalWithHandle(
     handle: string,
     content: string,
     meta: { source?: string; tool?: string },
-    now: number
+    now: number,
+    timings?: { originalMs: number; indexMs: number }
   ): string {
     const db = this.ensureOpen();
     const size = content.length;
 
-    // 已存在则先删旧记录(含 FTS 索引),再插新的
-    db.prepare("DELETE FROM originals WHERE handle = ?").run(handle);
-    db.prepare("DELETE FROM docs_fts WHERE handle = ?").run(handle);
-
-    db.prepare(
-      "INSERT INTO originals(handle, content, compressed, size, source, tool, created_at) VALUES (?, ?, 0, ?, ?, ?, ?)"
-    ).run(handle, content, size, meta.source ?? null, meta.tool ?? null, now);
-
-    this.indexLines(handle, content);
+    db.transaction(() => {
+      const start = performance.now();
+      const existing = this.getOriginal(handle);
+      if (existing) {
+        if (existing.content !== content || existing.source !== meta.source || existing.tool !== meta.tool) {
+          throw new Error("Handle collision: refusing to replace an existing original");
+        }
+        if (timings) timings.originalMs = performance.now() - start;
+        return;
+      }
+      db.prepare(
+        "INSERT INTO originals(handle, content, compressed, size, source, tool, created_at) VALUES (?, ?, 0, ?, ?, ?, ?)"
+      ).run(handle, content, size, meta.source ?? null, meta.tool ?? null, now);
+      if (timings) timings.originalMs = performance.now() - start;
+      const indexStart = performance.now();
+      this.indexLines(handle, content);
+      if (timings) timings.indexMs = performance.now() - indexStart;
+    })();
     return handle;
+  }
+
+  /** Commit backup, index and measurement together before emitting a view. */
+  saveOutput(content: string, metric: MetricInput & { handle: string }) {
+    const timings = { originalMs: 0, indexMs: 0, metricMs: 0 };
+    this.ensureOpen().transaction(() => {
+      this.saveOriginalWithHandle(metric.handle, content,
+        { source: metric.source, tool: metric.tool }, metric.createdAt, timings);
+      const start = performance.now();
+      this.recordMetric(metric);
+      timings.metricMs = performance.now() - start;
+    })();
+    return timings;
   }
 
   /** 取回原文(handle 不存在返回 undefined) */
@@ -670,9 +796,7 @@ class Store {
     const ins = db.prepare(
       "INSERT INTO docs_fts(handle, line_no, content) VALUES (?, ?, ?)"
     );
-    // 用事务批量插入,提速
-    db.exec("BEGIN");
-    try {
+    // Caller owns the transaction, including the original and metric rows.
       for (let i = 0; i < lines.length; i += CHUNK) {
         const lineNo = i + 1; // 1-based
         const chunk = lines.slice(i, i + CHUNK).join("\n");
@@ -680,11 +804,6 @@ class Store {
           ins.run(handle, lineNo, chunk);
         }
       }
-      db.exec("COMMIT");
-    } catch (e) {
-      db.exec("ROLLBACK");
-      throw e;
-    }
   }
 
   /** FTS5 查询安全化:包裹引号做短语查询,转义内部双引号 */

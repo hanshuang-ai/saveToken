@@ -118,7 +118,7 @@ export async function indexCode(handle: string): Promise<boolean> {
       : { toHandle: undefined as string | undefined };
     refRecords.push({
       fromHandle: handle,
-      fromSymbol: c.callerSymbol,
+      fromSymbol: c.callerSymbol ?? undefined,
       toHandle: target.toHandle,
       toSymbol: c.calleeName,
       refType: "call",
@@ -136,7 +136,7 @@ export async function indexCode(handle: string): Promise<boolean> {
       // 副作用 import(无导入名):存一条占位,to_symbol 用 source 标记
       refRecords.push({
         fromHandle: handle,
-        fromSymbol: null,
+        fromSymbol: undefined,
         toHandle,
         toSymbol: "(side-effect)",
         refType: "import",
@@ -149,7 +149,7 @@ export async function indexCode(handle: string): Promise<boolean> {
       for (const name of imp.importedNames) {
         refRecords.push({
           fromHandle: handle,
-          fromSymbol: null,
+          fromSymbol: undefined,
           toHandle,
           toSymbol: name,
           refType: "import",
@@ -257,7 +257,7 @@ function formatSymbol(handle: string, sym: SymbolRecord, src: string): string {
   lines.push("");
   lines.push(`〔${sym.kind}${sym.exported ? " · exported" : ""} · 行${sym.startLine}-${sym.endLine}〕`);
   lines.push(`完整实现:`);
-  lines.push(sym.bodyText ?? sym.signature);
+  lines.push(sym.bodyText ?? sym.signature ?? "");
   lines.push("");
 
   // 同文件调用关系

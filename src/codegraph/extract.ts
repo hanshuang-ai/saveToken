@@ -124,7 +124,7 @@ export function extractSymbols(rootNode: AstNode | null): ExtractResult {
           endLine: node.endPosition.row + 1,
           bodyText: node.text,
           signature: makeSignature(node.text),
-          exported: node.parent?.type === "export_statement",
+          exported: (node as any).parent?.type === "export_statement",
         });
         stack.push(name);
         for (const c of node.namedChildren) walk(c);
@@ -147,7 +147,7 @@ export function extractSymbols(rootNode: AstNode | null): ExtractResult {
             endLine: node.endPosition.row + 1,
             bodyText: node.text,
             signature: makeSignature(node.text),
-            exported: node.parent?.parent?.type === "export_statement",
+            exported: (node as any).parent?.parent?.type === "export_statement",
           });
           stack.push(name);
           for (const c of node.namedChildren) walk(c);

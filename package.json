@@ -1,10 +1,11 @@
 {
   "name": "savetoken",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "description": "通用 token 节省插件 —— 内容感知核心 + 可插拔适配器",
   "type": "module",
   "scripts": {
     "diagnose": "npx tsx src/diagnose.ts",
+    "typecheck": "tsc --noEmit",
     "test": "npx tsx --test tests/**/*.test.ts"
   },
   "license": "MIT",
@@ -16,6 +17,9 @@
     "web-tree-sitter": "^0.27.0"
   },
   "devDependencies": {
-    "tsx": "^4.0.0"
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.5.1",
+    "tsx": "^4.0.0",
+    "typescript": "^7.0.2"
   }
 }

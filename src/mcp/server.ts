@@ -1,11 +1,11 @@
 /**
  * server.ts —— frugal MCP server
  *
- * 暴露两个工具,让模型能取回被压缩的工具输出原文、查节省度量:
+ * 提供已存原文取回、字符度量及已有代码句柄的图谱工具:
  *   1. tok_retrieve —— 取回原文 / 关键词检索 / 按行号取片段
  *   2. tok_stats    —— 度量汇总(节省比、分类型、取回率)
  *
- * 配合 PostToolUse hook:hook 把工具输出压成压缩版 + 存原文(handle),
+ * 配合 PostToolUse hook:仅在采用精简视图时存原文(handle),
  * 模型在压缩版里看到 `handle=orig-1`,调用 tok_retrieve 取回完整原文或检索片段。
  * 这是安全模型第三道闸门的"取回"侧。
  *
@@ -26,7 +26,7 @@ import { retrieveSymbol, retrieveRefs } from "../codegraph/graph";
 
 // ─── 数据目录与 store 初始化 ──────────────────────────────────────────────────
 // 与 hook 脚本用同一份数据库,故路径逻辑保持一致。
-const DATA = join(homedir(), "Desktop", "frugal");
+const DATA = process.env.FRUGAL_DATA_DIR ?? join(homedir(), "Desktop", "frugal");
 const DB_PATH = join(DATA, "frugal.db");
 
 try {
@@ -67,7 +67,7 @@ function tokRetrieve(args: RetrieveArgs): RetrieveResult {
   if (query && query.trim()) {
     const hits = store.search(handle, query, 10);
     if (hits.length === 0) {
-      // 未命中不算"取回"——空查询不是"压缩太激进"的信号,不应累加取回计数
+      // 未命中不算实际取回,不累加计数。
       return { text: `handle=${handle} 中未找到关键词「${query}」的匹配。原文 ${exists.size} 字符,可换关键词或用 startLine 按行取。`, retrieved: false };
     }
     const lines = hits.map(
@@ -94,30 +94,28 @@ function tokRetrieve(args: RetrieveArgs): RetrieveResult {
 function tokStats(): string {
   const s = store.getMetricSummary();
   if (s.total === 0) {
-    return "尚无压缩记录。运行产生工具输出后(Bash/Read 被 hook 拦截压缩),这里会显示节省统计。";
+    return "尚无度量记录。采用精简视图并提交原文与度量后,这里会显示字符统计,不是实测 token 数。Read 保持不变。";
   }
   const pct = (s.savedRatio * 100).toFixed(1);
   const byType = Object.entries(s.byType)
     .map(([t, v]) => `  ${t}: ${v.count} 条,省 ${v.saved} 字符`)
     .join("\n");
-  // 会话级统计:按 session_id 分组,最近的活动通常即当前会话
   const sessions = store.getSessionBreakdown(5);
   const sessionLines = sessions.length
     ? sessions
         .map((ss, i) => {
           const tag = ss.sessionId ? ss.sessionId.slice(0, 8) : "(未知)";
           const sp = ss.original > 0 ? ((ss.saved / ss.original) * 100).toFixed(0) : "0";
-          const mark = i === 0 ? "  ← 最近会话(通常即本会话)" : "";
+          const mark = i === 0 ? "  ← 最近会话" : "";
           return `  ${tag}: ${ss.count} 条,省 ${ss.saved} 字符(${sp}%)${mark}`;
         })
         .join("\n")
     : "  (无会话信息)";
-  // 逐条明细:按时间倒序,展示每条的原始/压缩/节省%/取回,便于质量分析
   const records = store.getRecentMetrics(30);
   const recLines = records.length
     ? records
         .map((r) => {
-          const tool = (r.tool ?? "?").slice(0, 5).padEnd(5);
+          const tool = (r.tool ?? "?").slice(0, 5).padStart(5);
           const type = r.contentType.slice(0, 10).padEnd(10);
           const orig = String(r.originalSize).padStart(6);
           const comp = String(r.compressedSize).padStart(5);
@@ -127,12 +125,18 @@ function tokStats(): string {
         })
         .join("\n")
     : "  (无记录)";
+
+  const retrieveRate = store.getRetrieveRate();
+  const rRate = (retrieveRate.rate * 100).toFixed(1);
+
   return [
     `frugal 度量汇总:`,
+    `  大小按字符统计(JavaScript string.length),不是实测 token 数。`,
     `  总记录: ${s.total} 条(其中压缩 ${s.compressed} 条)`,
     `  原始: ${s.totalOriginal} 字符 → 压缩后: ${s.totalCompressed} 字符`,
     `  节省: ${s.saved} 字符(${pct}%)`,
-    `  被取回: ${s.retrievedCount} 次(取回多=压缩可能太激进,该调阈值)`,
+    `  被取回: ${s.retrievedCount} 次`,
+    `  取回率: ${rRate}%(${retrieveRate.retrieved}/${retrieveRate.compressed} 条压缩记录曾被取回,不含 dedup 记录)`,
     `逐条明细(最近 ${records.length} 条):`,
     recLines,
     `分类型:`,
@@ -145,7 +149,7 @@ function tokStats(): string {
 // ─── MCP server ────────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "frugal", version: "0.0.1" },
+  { name: "frugal", version: "0.0.3" },
   { capabilities: { tools: {} } }
 );
 
@@ -154,7 +158,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tok_retrieve",
       description:
-        "取回被 frugal 压缩的工具输出原文。当你在工具结果里看到「frugal:原文已存,handle=xxx」标记时,用本工具取回完整内容。三种用法:(1) 只传 handle 取完整原文;(2) 传 handle + query 按关键词检索相关片段(推荐,省 token);(3) 传 handle + startLine + count 按行号取片段。优先用检索/按行,避免取回超大全文。",
+        "按指定 handle(如 orig-1)取回已存原文。用 query 检索,或 startLine + count 按行取;仅传 handle 取全文(有大小上限)。",
       inputSchema: {
         type: "object",
         properties: {
@@ -164,7 +168,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           query: {
             type: "string",
-            description: "可选:关键词,做全文检索返回匹配片段(带行号)。比取全文省 token",
+            description: "可选:关键词,做全文检索返回匹配片段(带行号)",
           },
           startLine: {
             type: "number",
@@ -181,7 +185,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tok_stats",
       description:
-        "查看 frugal 的 token 节省度量汇总:总压缩次数、节省字符数与比例、分内容类型统计、被取回次数(取回率是压缩是否太激进的信号)。无参数。",
+        "查看已存字符度量(非实测 token):记录数、字符减少量与比例、类型/会话明细、取回次数及记录取回率。无参数。",
       inputSchema: {
         type: "object",
         properties: {},
@@ -190,7 +194,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tok_code_symbol",
       description:
-        "取代码符号定义(函数/类/方法)及完整实现。Read 代码被 frugal 截断后,查某函数完整代码+同文件调用关系用这个。用法:(1) handle+symbol 取该符号完整实现;(2) handle+query 模糊查符号列表;(3) 只传 handle 列出所有符号概览。仅支持 TS/JS。",
+        "查询已有持久化代码 handle 的符号定义及实现。handle + symbol 精确取符号,handle + query 模糊查找,仅传 handle 列符号。仅支持 TS/JS;不改变 Read 输出。",
       inputSchema: {
         type: "object",
         properties: {
@@ -213,7 +217,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tok_code_refs",
       description:
-        "取符号调用/被调用关系(跨文件自动解析)。查'bar 调用了什么'(callees)或'谁调用了 bar'(callers)。已读文件自动解析跨文件引用,未读文件提示 Read。仅支持 TS/JS。",
+        "查询已有持久化 TS/JS 代码 handle 的调用关系:callers 为调用方,callees 为被调用方。跨文件解析依赖已存代码,不改变 Read 输出。",
       inputSchema: {
         type: "object",
         properties: {
@@ -254,7 +258,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       });
       text = r.text;
       // 仅当模型实际取回原文内容(命中/按行取到/全文)才累加取回计数。
-      // 未命中、超大提示、错误不计——空查询不是"压缩太激进"的信号。
+      // 未命中、超大提示、错误不计。
       if (r.retrieved && args.handle) {
         try {
           store.incrementRetrieved(String(args.handle));
