@@ -1,0 +1,51 @@
+.claude-plugin/plugin.json
+  s_70e851b9d8eb61::t_e945f7650fbfba 4,11-12
+.mcp.json
+  s_70e851b9d8eb61::t_dd36f0daa9d5db 4-5
+commands/stats.md
+  s_70e851b9d8eb61::t_8fe25e7437230b 8,12
+commands/status.md
+  s_70e851b9d8eb61::t_e95d7aaa0bc907 9
+hooks/hooks.json
+  s_70e851b9d8eb61::t_1e0c9b343eb1b0 10
+package-lock.json
+  s_70e851b9d8eb61::t_8ac9f3d04aab93 3,9,13,15,24-69,522-527,566-576,937-992,1033-1041,1126-1137,1200-1205,1352-1363,1434-1439,1549-1565,1808-1816,1878-1892,1912-1929,2014-2019,2035-2052,2060-2087,2431-2439,2493-2496,2499-2500,2502-2503,2505-2506,2509-2510,2512-2513,2516-2519,2522-2523
+package.json
+  s_70e851b9d8eb61::t_ccbb51ba2f364e 3,7,9,14,16
+src/codegraph/extract.ts
+  s_70e851b9d8eb61::t_5083d2042a0f17 2,4-5,8-23,29,38-39,56,58-63,65-82,85-90,103-105,108-121,123-136,138-151,153-156,158-169,171-186,189-198,201,204-210,212-243
+src/codegraph/graph.ts
+  s_70e851b9d8eb61::t_65e80e0c6abc8e 7,21,29-62,74-211,256-257,259-279,282-297,301-302,305-310,313-319,322-330,335,337,342-355,370-444,458-460,462,563-566
+src/codegraph/languages.ts
+  s_70e851b9d8eb61::t_2c824498c169a6 5,7,9-11,18,21-22,27-31,42-43,73
+src/dashboard/server.ts
+  s_70e851b9d8eb61::t_d67a9446a70c6a 4
+src/diagnose.ts
+  s_70e851b9d8eb61::t_c0e08d18ffa9a5 10,42-44
+src/mcp/server.ts
+  s_70e851b9d8eb61::t_2ac53ba5b94bc7 25,152,194-208,212,235,284-293
+tests/hook-mcp.test.ts
+  s_70e851b9d8eb61::t_d2cb88a2cb9c4d 71,82-153
+tests/quick-test.ts
+  s_70e851b9d8eb61::t_4fe7c12100500e 9,126
+tests/run-scenarios.ts
+  s_70e851b9d8eb61::t_028828b2f2eff4 8,200,206
+设计文档.md
+  s_70e851b9d8eb61::t_717067a44e3a17 4,138,329-337,344,348
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bbee3fd0dd2bed6ab5579558255eec7647609108",
+  "prompts": {},
+  "sessions": {
+    "s_70e851b9d8eb61": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a7dc-fd2e-7ba0-a110-fe251313b5f8",
+        "model": "unknown"
+      },
+      "human_author": "benliu <benliu@tinnove.com.cn>"
+    }
+  }
+}
