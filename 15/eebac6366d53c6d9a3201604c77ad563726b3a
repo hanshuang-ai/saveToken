@@ -1,0 +1,25 @@
+README.md
+  s_59379a93fad5e0::t_36bbeb19671a0f 32-34
+src/codegraph/graph.ts
+  s_59379a93fad5e0::t_f63e2a1424ad7d 63-75,105-122,442-444,446,452-453,465-467,493-494,525-526,530,535,544-546,548,556-558,560,564,569-578,586-587,590,594-595,598,677-682,717,723-728,740
+src/mcp/server.ts
+  s_59379a93fad5e0::t_862a750721b7d0 41-48,76,82,89-90,92-93,238-245,316-320
+设计文档.md
+  s_59379a93fad5e0::t_5d00c74db8d86f 345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "15eebac6366d53c6d9a3201604c77ad563726b3a",
+  "prompts": {},
+  "sessions": {
+    "s_59379a93fad5e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a91c-0bf5-7b72-b2c4-98606250c0f4",
+        "model": "unknown"
+      },
+      "human_author": "benliu <benliu@tinnove.com.cn>"
+    }
+  }
+}
