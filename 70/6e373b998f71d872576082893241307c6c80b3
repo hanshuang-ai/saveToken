@@ -1,0 +1,19 @@
+tests/session-results.json
+  s_70e851b9d8eb61::t_35e4202399cee3 2-3,6-9,14-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "706e373b998f71d872576082893241307c6c80b3",
+  "prompts": {},
+  "sessions": {
+    "s_70e851b9d8eb61": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a7dc-fd2e-7ba0-a110-fe251313b5f8",
+        "model": "unknown"
+      },
+      "human_author": "benliu <benliu@tinnove.com.cn>"
+    }
+  }
+}
