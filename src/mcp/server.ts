@@ -149,7 +149,7 @@ function tokStats(): string {
 // ─── MCP server ────────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "frugal", version: "0.0.3" },
+  { name: "frugal", version: "0.0.4" },
   { capabilities: { tools: {} } }
 );
 
