@@ -108,6 +108,10 @@ class StationService {
     assert.ok(tsMapText.includes("reload"));
     const tsSymbol = await client.callTool({ name: "tok_code_symbol", arguments: { handle: tsHandle, symbol: "saveStation" } });
     assert.ok(JSON.stringify(tsSymbol).includes("loadStation"));
+    assert.ok(JSON.stringify(tsSymbol).includes("实现未内联"));
+    assert.ok(!JSON.stringify(tsSymbol).includes("return loadStation(id);"));
+    const tsSymbolBody = await client.callTool({ name: "tok_code_symbol", arguments: { handle: tsHandle, symbol: "saveStation", includeBody: true } });
+    assert.ok(JSON.stringify(tsSymbolBody).includes("return loadStation(id);"));
 
     const vueRaw = `<template>
   <FuelCard :station="station" :price="price" @select="selectFuel" />

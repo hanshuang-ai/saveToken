@@ -60,6 +60,19 @@ interface CodeBlock {
   lineOffset: number;
 }
 
+interface SymbolViewOptions {
+  includeBody?: boolean;
+  maxBodyChars?: number;
+}
+
+const MAX_MAP_SYMBOLS = 80;
+const MAX_MAP_CALL_ROWS = 40;
+const MAX_FUZZY_SYMBOLS = 20;
+const DEFAULT_SYMBOL_BODY_CHARS = 1200;
+const MAX_SYMBOL_BODY_CHARS = 4000;
+const MAX_REFS_PER_SYMBOL = 20;
+const MAX_REF_LINES = 80;
+
 // ─── 语言判定 ────────────────────────────────────────────────────────────────
 
 /** 从 handle 的原文 source 路径推断代码语言。非代码/无 source 返回 undefined。 */
@@ -87,6 +100,24 @@ function langFromScriptAttrs(attrs: Record<string, string | true>): CodeLang {
 
 function uniq(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+function oneLine(text = "", maxChars = 180): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxChars) return compact;
+  return `${compact.slice(0, maxChars).trimEnd()}...`;
+}
+
+function cappedList<T>(items: T[], max: number): { shown: T[]; omitted: number } {
+  return {
+    shown: items.slice(0, max),
+    omitted: Math.max(0, items.length - max),
+  };
+}
+
+function normalizeBodyBudget(value: number | undefined): number {
+  if (!Number.isFinite(value ?? NaN)) return DEFAULT_SYMBOL_BODY_CHARS;
+  return Math.max(200, Math.min(Math.trunc(value!), MAX_SYMBOL_BODY_CHARS));
 }
 
 function normalizeAttrs(attrs: Record<string, unknown> | undefined): Record<string, string | true> {
@@ -408,15 +439,18 @@ export async function retrieveCodeMap(handle: string): Promise<GraphResult> {
 
   if (symbols.length > 0) {
     lines.push("符号列表:");
-    for (const s of symbols) {
-      lines.push(`  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${s.signature ?? ""}`);
+    const { shown, omitted } = cappedList(symbols, MAX_MAP_SYMBOLS);
+    for (const s of shown) {
+      lines.push(`  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${oneLine(s.signature)}`);
     }
+    if (omitted) lines.push(`  ... 另有 ${omitted} 个符号省略,可用 tok_code_symbol(handle="${handle}", query="关键词") 精查`);
   } else if (info.lang) {
     lines.push("符号列表: 未提取到函数/类/命名箭头函数。");
   }
 
   const callLines: string[] = [];
-  for (const s of symbols) {
+  for (const s of symbols.slice(0, MAX_MAP_SYMBOLS)) {
+    if (callLines.length >= MAX_MAP_CALL_ROWS) break;
     const refs = store.getReferences(handle, "callees", s.name);
     if (refs.length === 0) continue;
     const compact = refs.slice(0, 8).map((r) =>
@@ -428,6 +462,9 @@ export async function retrieveCodeMap(handle: string): Promise<GraphResult> {
     lines.push("");
     lines.push("调用概览:");
     lines.push(...callLines);
+    if (callLines.length >= MAX_MAP_CALL_ROWS) {
+      lines.push(`  ... 调用概览已截断,可用 tok_code_refs(handle="${handle}", symbol="方法名", direction="callees") 精查`);
+    }
   }
 
   if (info.vue) {
@@ -453,7 +490,8 @@ export async function retrieveCodeMap(handle: string): Promise<GraphResult> {
 export async function retrieveSymbol(
   handle: string,
   symbol?: string,
-  query?: string
+  query?: string,
+  options: SymbolViewOptions = {}
 ): Promise<GraphResult> {
   const info = codeInfoForHandle(handle);
   if (!info?.rec) return { text: `❌ handle=${handle} 不存在`, retrieved: false };
@@ -484,16 +522,17 @@ export async function retrieveSymbol(
       if (fuzzy.length === 1) {
         sym = fuzzy[0];
       } else {
-        const list = fuzzy
+        const { shown, omitted } = cappedList(fuzzy, MAX_FUZZY_SYMBOLS);
+        const list = shown
           .map((s) => `  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""}`)
           .join("\n");
         return {
-          text: `「${symbol}」匹配多个符号,请用精确名重查:\n${list}`,
+          text: `「${symbol}」匹配多个符号,请用精确名重查:\n${list}${omitted ? `\n  ... 另有 ${omitted} 个匹配省略` : ""}`,
           retrieved: true,
         };
       }
     }
-    return { text: formatSymbol(handle, sym, src), retrieved: true };
+    return { text: formatSymbol(handle, sym, src, options), retrieved: true };
   }
 
   // 模式2:模糊 query
@@ -502,10 +541,11 @@ export async function retrieveSymbol(
     if (fuzzy.length === 0) {
       return { text: `handle=${handle}(${src})未找到含「${query}」的符号。`, retrieved: false };
     }
-    const list = fuzzy
-      .map((s) => `  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${s.signature}`)
+    const { shown, omitted } = cappedList(fuzzy, MAX_FUZZY_SYMBOLS);
+    const list = shown
+      .map((s) => `  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${oneLine(s.signature)}`)
       .join("\n");
-    return { text: `handle=${handle}(${src})含「${query}」的符号:\n${list}`, retrieved: true };
+    return { text: `handle=${handle}(${src})含「${query}」的符号:\n${list}${omitted ? `\n  ... 另有 ${omitted} 个匹配省略,请缩小 query` : ""}`, retrieved: true };
   }
 
   // 模式3:所有符号概览
@@ -513,20 +553,29 @@ export async function retrieveSymbol(
   if (all.length === 0) {
     return { text: `handle=${handle}(${src})未提取到符号。`, retrieved: false };
   }
-  const list = all
-    .map((s) => `  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${s.signature}`)
+  const { shown, omitted } = cappedList(all, MAX_MAP_SYMBOLS);
+  const list = shown
+    .map((s) => `  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${oneLine(s.signature)}`)
     .join("\n");
-  return { text: `handle=${handle}(${src})符号列表:\n${list}`, retrieved: true };
+  return { text: `handle=${handle}(${src})符号列表:\n${list}${omitted ? `\n  ... 另有 ${omitted} 个符号省略,请用 query 精查` : ""}`, retrieved: true };
 }
 
 /** 格式化单个符号:完整 body + 同文件 callers/callees */
-function formatSymbol(handle: string, sym: SymbolRecord, src: string): string {
+function formatSymbol(handle: string, sym: SymbolRecord, src: string, options: SymbolViewOptions): string {
   const lines: string[] = [];
   lines.push(`符号 ${sym.name}(handle=${handle},来源:${src}):`);
   lines.push("");
   lines.push(`〔${sym.kind}${sym.exported ? " · exported" : ""} · 行${sym.startLine}-${sym.endLine}〕`);
-  lines.push(`完整实现:`);
-  lines.push(sym.bodyText ?? sym.signature ?? "");
+  lines.push(`签名: ${oneLine(sym.signature ?? "")}`);
+  if (options.includeBody) {
+    const budget = normalizeBodyBudget(options.maxBodyChars);
+    const body = sym.bodyText ?? sym.signature ?? "";
+    lines.push(`实现预览${body.length > budget ? `(前 ${budget} 字符)` : ""}:`);
+    lines.push(body.length > budget ? `${body.slice(0, budget).trimEnd()}\n[frugal: implementation truncated; use tok_retrieve(handle="${handle}", startLine=${sym.startLine}, count=${Math.min(160, Math.max(1, sym.endLine - sym.startLine + 1))}) for exact code]` : body);
+  } else {
+    const count = Math.min(160, Math.max(1, sym.endLine - sym.startLine + 1));
+    lines.push(`实现未内联。需要源码时用: tok_retrieve(handle="${handle}", startLine=${sym.startLine}, count=${count})`);
+  }
   lines.push("");
 
   // 同文件调用关系
@@ -534,15 +583,19 @@ function formatSymbol(handle: string, sym: SymbolRecord, src: string): string {
   const callers = store.getReferences(handle, "callers", sym.name);
   if (callees.length > 0) {
     lines.push(`本符号调用(callees):`);
-    for (const r of callees) {
+    const { shown, omitted } = cappedList(callees, MAX_REFS_PER_SYMBOL);
+    for (const r of shown) {
       lines.push(`  ${r.toSymbol}(行${r.line})${r.resolved ? "" : r.importSrc ? ` — imported from ${r.importSrc}` : ""}`);
     }
+    if (omitted) lines.push(`  ... 另有 ${omitted} 条调用省略,可用 tok_code_refs 精查`);
   }
   if (callers.length > 0) {
     lines.push(`本文件内被调用(callers):`);
-    for (const r of callers) {
+    const { shown, omitted } = cappedList(callers, MAX_REFS_PER_SYMBOL);
+    for (const r of shown) {
       lines.push(`  ${r.fromSymbol ?? "?"}(行${r.line})`);
     }
+    if (omitted) lines.push(`  ... 另有 ${omitted} 条调用方省略,可用 tok_code_refs 精查`);
   }
   return lines.join("\n");
 }
@@ -621,7 +674,12 @@ async function collectCallees(
   visited.add(key);
 
   const refs = store.getReferences(handle, "callees", symbol);
-  for (const r of refs) {
+  const { shown, omitted } = cappedList(refs, MAX_REFS_PER_SYMBOL);
+  for (const r of shown) {
+    if (out.length >= MAX_REF_LINES) {
+      out.push(`${indent}... 调用关系输出达到预算上限,请缩小 symbol/depth 精查`);
+      return;
+    }
     if (r.toHandle) {
       // 已解析到某 handle
       if (r.toHandle === handle) {
@@ -656,12 +714,18 @@ async function collectCallees(
       }
     }
   }
+  if (omitted) out.push(`${indent}... 另有 ${omitted} 条调用省略,请缩小查询`);
 }
 
 /** 收集 callers(本文件内 + 跨文件已解析指向本 handle 的) */
 function collectCallers(handle: string, symbol: string, src: string, out: string[]): void {
   const refs = store.getReferences(handle, "callers", symbol);
-  for (const r of refs) {
+  const { shown, omitted } = cappedList(refs, MAX_REFS_PER_SYMBOL);
+  for (const r of shown) {
+    if (out.length >= MAX_REF_LINES) {
+      out.push("  ... 调用方输出达到预算上限,请缩小查询");
+      return;
+    }
     if (r.fromHandle === handle) {
       // 同文件内调用方
       const caller = r.fromSymbol ? store.findSymbolByName(handle, r.fromSymbol) : undefined;
@@ -673,4 +737,5 @@ function collectCallers(handle: string, symbol: string, src: string, out: string
       out.push(`  ▸ ${r.fromSymbol ?? "?"}(行${r.line}) [跨文件 ← ${callerSrc}]${caller ? ` — ${caller.signature}` : ""}`);
     }
   }
+  if (omitted) out.push(`  ... 另有 ${omitted} 条调用方省略,请缩小查询`);
 }

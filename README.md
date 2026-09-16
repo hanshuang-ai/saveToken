@@ -29,8 +29,9 @@ Bash 文本 -> 10,000 字符早期筛选 -> 纯候选生成 -> 含标记的净�
 |---|---|
 | `tok_retrieve` | 指定已存 `handle`,用 `query` 检索或 `startLine` + `count` 按行取回;只传 handle 可取全文,上限 60,000 字符 |
 | `tok_stats` | 已存字符度量、分类型/会话明细、取回次数及记录取回率 |
-| `tok_code_symbol` | 查询已有持久化 TS/JS 代码 handle 的符号定义与实现 |
-| `tok_code_refs` | 查询已有持久化 TS/JS 代码 handle 的调用关系 |
+| `tok_code_map` | 查询已有持久化代码 handle 的轻量结构图,包含符号、Vue SFC 分区、组件/事件/绑定概览 |
+| `tok_code_symbol` | 查询已有持久化代码 handle 的符号签名、位置与调用关系;默认不内联完整实现,需要源码时再用 `tok_retrieve(startLine,count)` 精取 |
+| `tok_code_refs` | 查询已有持久化代码 handle 的调用关系,输出有预算上限 |
 
 保留 codegraph 工具是为了已有持久化代码句柄,并不意味着 v2 会压缩 `Read` 或为新读取自动生成代码句柄。
 

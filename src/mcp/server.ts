@@ -38,6 +38,14 @@ try {
 
 /** 全文取回的安全上限:超过此字符数提示模型用 query/startLine 精确取,而非倾倒全文 */
 const MAX_FULL_TEXT = 60000;
+const QUERY_HIT_LIMIT = 5;
+const MAX_SEARCH_SNIPPET_CHARS = 700;
+const MAX_RETRIEVE_LINE_COUNT = 160;
+
+function clampText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars).trimEnd()}\n[frugal: snippet truncated; use tok_retrieve(startLine,count) for more context]`;
+}
 
 // ─── 工具实现 ──────────────────────────────────────────────────────────────────
 
@@ -65,22 +73,24 @@ function tokRetrieve(args: RetrieveArgs): RetrieveResult {
 
   // 模式1:关键词检索 —— 返回匹配片段(带行号),不全量倾倒
   if (query && query.trim()) {
-    const hits = store.search(handle, query, 10);
+    const hits = store.search(handle, query, QUERY_HIT_LIMIT);
     if (hits.length === 0) {
       // 未命中不算实际取回,不累加计数。
       return { text: `handle=${handle} 中未找到关键词「${query}」的匹配。原文 ${exists.size} 字符,可换关键词或用 startLine 按行取。`, retrieved: false };
     }
     const lines = hits.map(
-      (h) => `[行 ${h.lineNo}] ${h.snippet}`
+      (h) => `[行 ${h.lineNo}] ${clampText(h.snippet, MAX_SEARCH_SNIPPET_CHARS)}`
     );
     return { text: `handle=${handle} 检索「${query}」命中 ${hits.length} 条(按相关性排序):\n\n${lines.join("\n\n")}`, retrieved: true };
   }
 
   // 模式2:按行号取片段 —— startLine + count
   if (startLine != null && count != null) {
-    const chunk = store.getLines(handle, startLine, count);
+    const safeCount = Math.max(1, Math.min(Math.trunc(count), MAX_RETRIEVE_LINE_COUNT));
+    const chunk = store.getLines(handle, startLine, safeCount);
     if (!chunk) return { text: `❌ handle=${handle} 取行失败`, retrieved: false };
-    return { text: `handle=${handle} 第 ${startLine}~${startLine + count - 1} 行:\n\n${chunk}`, retrieved: true };
+    const capped = safeCount < count ? `\n[frugal: requested ${count} lines, capped to ${safeCount}; repeat with a later startLine if needed]` : "";
+    return { text: `handle=${handle} 第 ${startLine}~${startLine + safeCount - 1} 行:${capped}\n\n${chunk}`, retrieved: true };
   }
 
   // 模式3:取完整原文 —— 超大时提示改用检索/按行,避免又把巨量内容塞回上下文(违背省 token 初衷)
@@ -225,6 +235,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "可选:模糊查询词,匹配符号名",
           },
+          includeBody: {
+            type: "boolean",
+            description: "可选:是否内联符号实现。默认 false,建议先看签名/调用关系,再用 tok_retrieve 按行取必要片段。",
+          },
+          maxBodyChars: {
+            type: "number",
+            description: "可选:includeBody=true 时的实现字符上限,默认 1200,最大 4000。",
+          },
         },
         required: ["handle"],
       },
@@ -295,7 +313,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const r = await retrieveSymbol(
         String(args.handle ?? ""),
         args.symbol != null ? String(args.symbol) : undefined,
-        args.query != null ? String(args.query) : undefined
+        args.query != null ? String(args.query) : undefined,
+        {
+          includeBody: args.includeBody === true,
+          maxBodyChars: args.maxBodyChars != null ? Number(args.maxBodyChars) : undefined,
+        }
       );
       text = r.text;
       if (r.retrieved && args.handle) {
