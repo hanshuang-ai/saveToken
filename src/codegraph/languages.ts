@@ -2,30 +2,33 @@
  * languages.ts —— 代码语言元数据(纯数据,无依赖)
  *
  * 这是 src/codegraph/ 里唯一可以被 hook 安全 import 的模块:
- *   hook 每次调用都是新 Bun 进式,绝不能背 tree-sitter(WASM init 开销大、部署重)。
+ *   hook 每次调用都是新 Node 进程,不能背代码解析器依赖与初始化开销。
  *   hook 只需用 langForExt() 判定 Read 的文件是不是代码,据此选不同的 note 文案。
- *   parser.ts/extract.ts/graph.ts 才 import web-tree-sitter,且只被 MCP server(长驻)加载。
+ *   extract.ts/graph.ts 才 import ts-morph / Vue compiler,且只被 MCP server(长驻)加载。
  *
- * TS/JS 优先(MVP 范围):覆盖 8 个扩展名,对应 3 个 tree-sitter 语法包。
+ * TS/JS 优先(MVP 范围):覆盖常见 TS/JS 扩展名,用 ts-morph 提取符号。
+ * .vue 由 graph.ts 先抽取 <script>/<script setup> 后再按 TS/JS 解析,
+ * SFC/template 结构由 @vue/compiler-sfc 提取。
  */
 
 import { dirname, resolve, join } from "node:path";
 
 /** frugal 支持的代码扩展名(命中即走 AST 检索路径) */
 export const CODE_LANGS = new Set([
-  "ts", "tsx", "js", "jsx", "cjs", "mjs", "cts", "mts",
+  "ts", "tsx", "js", "jsx", "cjs", "mjs", "cts", "mts", "vue",
 ]);
 
-/** tree-sitter 语法包标识。对应 wasm 文件名前缀。 */
-export type CodeLang = "typescript" | "tsx" | "javascript";
+/** 代码解析语言标识。 */
+export type CodeLang = "typescript" | "tsx" | "javascript" | "jsx";
 
 /**
  * 扩展名 → 语法包。返回 undefined 表示非代码(走原 tok_retrieve 扁平检索)。
  *
- * 分配依据(tree-sitter 语法包能力):
- *   - typescript:tree-sitter-typescript.wasm,TS 语法(.cts/.mts 是 TS 的 ESM/CJS 变体)
- *   - tsx:tree-sitter-tsx.wasm,TS + JSX
- *   - javascript:tree-sitter-javascript.wasm,JS + JSX(.cjs/.mjs 是 JS 的 ESM/CJS 变体)
+ * 分配依据(ts-morph / TypeScript ScriptKind):
+ *   - typescript:TS 语法(.cts/.mts 是 TS 的 ESM/CJS 变体)
+ *   - tsx:TS + JSX
+ *   - javascript:JS 语法(.cjs/.mjs 是 JS 的 ESM/CJS 变体)
+ *   - jsx:JS + JSX
  */
 export function langForExt(ext: string): CodeLang | undefined {
   switch (ext) {
@@ -35,8 +38,9 @@ export function langForExt(ext: string): CodeLang | undefined {
       return "typescript";
     case "tsx":
       return "tsx";
-    case "js":
     case "jsx":
+      return "jsx";
+    case "js":
     case "cjs":
     case "mjs":
       return "javascript";
@@ -66,7 +70,7 @@ export function resolveImportPath(importerPath: string, importSrc: string): stri
   const importerDir = dirname(importerPath);
   const base = resolve(importerDir, importSrc); // 绝对路径,可能无扩展名或带部分名
 
-  const EXTS = [".ts", ".tsx", ".js", ".jsx", ".cts", ".mts", ".cjs", ".mjs"];
+  const EXTS = [".ts", ".tsx", ".js", ".jsx", ".cts", ".mts", ".cjs", ".mjs", ".vue"];
   const seen = new Set<string>();
   const candidates: string[] = [];
 

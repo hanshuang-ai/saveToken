@@ -4,7 +4,7 @@
  * 参考 CodeGraph "解析"阶段 + Aider 精简签名思路。
  *
  * 流程:
- *   indexCode(handle) —— 取 orig-N 原文 → parseCode → extractSymbols
+ *   indexCode(handle) —— 取 orig-N 原文 → extractSymbols(ts-morph)
  *                         → 存 symbols / refs 表(幂等)。import 路径尝试解析到已读文件。
  *   retrieveSymbol    —— 取符号定义(完整 body)+ 同文件调用关系。
  *   retrieveRefs      —— callers/callees,跨文件:to_handle 已解析则递归取该符号(深度≤3),
@@ -15,15 +15,49 @@
 
 import { store } from "../store/db";
 import type { SymbolRecord, RefRecord } from "../store/db";
-import { parseCode } from "./parser";
 import { extractSymbols } from "./extract";
 import { langForExt, resolveImportPath } from "./languages";
 import type { CodeLang } from "./languages";
+import { parse as parseVueSfc } from "@vue/compiler-sfc";
 
 /** 取回结果:text 给模型看;retrieved 表示是否实际取回了内容(供 incrementRetrieved) */
 export interface GraphResult {
   text: string;
   retrieved: boolean;
+}
+
+interface HandleCodeInfo {
+  rec: NonNullable<ReturnType<typeof store.getOriginal>>;
+  lang?: CodeLang;
+  sourceLang?: string;
+  code: string;
+  lineOffset: number;
+  codeBlocks?: CodeBlock[];
+  vue?: VueInfo;
+}
+
+interface VueInfo {
+  scripts: VueBlock[];
+  template?: VueBlock;
+  styleCount: number;
+  components: string[];
+  events: string[];
+  bindings: string[];
+  parseErrors: string[];
+}
+
+interface VueBlock {
+  attrs: Record<string, string | true>;
+  content: string;
+  startLine: number;
+  lang?: string;
+  setup?: boolean;
+}
+
+interface CodeBlock {
+  code: string;
+  lang: CodeLang;
+  lineOffset: number;
 }
 
 // ─── 语言判定 ────────────────────────────────────────────────────────────────
@@ -35,6 +69,144 @@ function langForHandle(handle: string): CodeLang | undefined {
   const dot = rec.source.lastIndexOf(".");
   const ext = dot >= 0 ? rec.source.slice(dot + 1).toLowerCase() : "";
   return langForExt(ext);
+}
+
+function extForSource(source?: string): string {
+  if (!source) return "";
+  const dot = source.lastIndexOf(".");
+  return dot >= 0 ? source.slice(dot + 1).toLowerCase() : "";
+}
+
+function langFromScriptAttrs(attrs: Record<string, string | true>): CodeLang {
+  const lang = String(attrs.lang ?? "").toLowerCase();
+  if (lang === "ts" || lang === "typescript") return "typescript";
+  if (lang === "tsx") return "tsx";
+  if (lang === "jsx") return "jsx";
+  return "javascript";
+}
+
+function uniq(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeAttrs(attrs: Record<string, unknown> | undefined): Record<string, string | true> {
+  const out: Record<string, string | true> = {};
+  for (const [key, value] of Object.entries(attrs ?? {})) {
+    out[key] = typeof value === "string" ? value : true;
+  }
+  return out;
+}
+
+function blockFromSfc(block: {
+  content: string;
+  attrs?: Record<string, unknown>;
+  loc?: { start?: { line?: number } };
+}, setup = false): VueBlock {
+  const attrs = normalizeAttrs(block.attrs);
+  return {
+    attrs,
+    content: block.content,
+    startLine: block.loc?.start?.line ?? 1,
+    lang: typeof attrs.lang === "string" ? attrs.lang : undefined,
+    setup,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function expressionContent(value: unknown): string {
+  return isRecord(value) && typeof value.content === "string" ? value.content : "";
+}
+
+function isVueComponentTag(tag: string, tagType: unknown): boolean {
+  return tagType === 1 || /^[A-Z]/.test(tag) || tag.includes("-");
+}
+
+function walkVueTemplateAst(
+  node: unknown,
+  out: { components: string[]; events: string[]; bindings: string[] }
+): void {
+  if (!isRecord(node)) return;
+  const tag = typeof node.tag === "string" ? node.tag : "";
+  if (tag && isVueComponentTag(tag, node.tagType)) out.components.push(tag);
+
+  const props = Array.isArray(node.props) ? node.props : [];
+  for (const prop of props) {
+    if (!isRecord(prop) || prop.type !== 7 || typeof prop.name !== "string") continue;
+    const arg = expressionContent(prop.arg);
+    if (prop.name === "on" && arg) {
+      out.events.push(arg);
+    } else if (prop.name === "bind" && arg) {
+      out.bindings.push(arg);
+    } else if (prop.name === "model") {
+      out.bindings.push(arg || "modelValue");
+    }
+  }
+
+  const children = Array.isArray(node.children) ? node.children : [];
+  for (const child of children) walkVueTemplateAst(child, out);
+}
+
+function extractVueInfo(content: string, filename?: string): VueInfo {
+  const parsed = parseVueSfc(content, { filename: filename ?? "anonymous.vue" });
+  const descriptor = parsed.descriptor;
+  const scripts = [
+    ...(descriptor.script ? [blockFromSfc(descriptor.script)] : []),
+    ...(descriptor.scriptSetup ? [blockFromSfc(descriptor.scriptSetup, true)] : []),
+  ];
+  const template = descriptor.template ? blockFromSfc(descriptor.template) : undefined;
+  const templateParts = { components: [] as string[], events: [] as string[], bindings: [] as string[] };
+  if (descriptor.template?.ast) walkVueTemplateAst(descriptor.template.ast, templateParts);
+  return {
+    scripts,
+    template,
+    styleCount: descriptor.styles.length,
+    components: uniq(templateParts.components),
+    events: uniq(templateParts.events),
+    bindings: uniq(templateParts.bindings),
+    parseErrors: parsed.errors.map((error) => error instanceof Error ? error.message : String(error)),
+  };
+}
+
+function codeInfoForHandle(handle: string): HandleCodeInfo | undefined {
+  const rec = store.getOriginal(handle);
+  if (!rec) return undefined;
+  const ext = extForSource(rec.source);
+  if (ext === "vue") {
+    const vue = extractVueInfo(rec.content, rec.source);
+    const codeBlocks = vue.scripts
+      .map((block) => ({
+        code: block.content,
+        lang: langFromScriptAttrs(block.attrs),
+        lineOffset: block.startLine - 1,
+      }))
+      .filter((block) => block.code.trim());
+    const mainScript = vue.scripts.find((block) => block.setup) ?? vue.scripts[0];
+    if (!mainScript) {
+      return {
+        rec,
+        sourceLang: "vue",
+        code: "",
+        lineOffset: 0,
+        vue,
+      };
+    }
+    const lang = langFromScriptAttrs(mainScript.attrs);
+    return {
+      rec,
+      lang,
+      sourceLang: "vue",
+      code: mainScript.content,
+      lineOffset: mainScript.startLine - 1,
+      codeBlocks,
+      vue,
+    };
+  }
+  const lang = langForHandle(handle);
+  if (!lang) return { rec, code: rec.content, lineOffset: 0 };
+  return { rec, lang, sourceLang: lang, code: rec.content, lineOffset: 0 };
 }
 
 /** 取 handle 原文的来源路径(给提示用) */
@@ -81,83 +253,106 @@ function resolveCallTarget(
  * @returns true=已索引(是代码);false=非代码/找不到原文
  */
 export async function indexCode(handle: string): Promise<boolean> {
-  const rec = store.getOriginal(handle);
-  if (!rec) return false;
-  const lang = langForHandle(handle);
-  if (!lang) return false; // 非代码语言,不索引
+  const info = codeInfoForHandle(handle);
+  if (!info?.rec || !info.lang || !info.code.trim()) return false; // 非代码/无脚本,不索引
 
-  const root = await parseCode(rec.content, lang);
-  const { definitions, imports, calls } = extractSymbols(root);
-  const now = rec.createdAt;
-  const importerPath = rec.source ?? "";
+  const now = info.rec.createdAt;
+  const importerPath = info.rec.source ?? "";
+  const blocks = info.codeBlocks?.length ? info.codeBlocks : [{
+    code: info.code,
+    lang: info.lang,
+    lineOffset: info.lineOffset,
+  }];
+
+  const symRecords: SymbolRecord[] = [];
+  const refRecords: RefRecord[] = [];
+  const blockResults: {
+    definitions: ReturnType<typeof extractSymbols>["definitions"];
+    imports: ReturnType<typeof extractSymbols>["imports"];
+    calls: ReturnType<typeof extractSymbols>["calls"];
+    lineOffset: number;
+  }[] = [];
+
+  for (const block of blocks) {
+    const extracted = extractSymbols(block.code, block.lang, importerPath);
+    blockResults.push({ ...extracted, lineOffset: block.lineOffset });
+  }
 
   // ── 存符号 ──
-  const symRecords: SymbolRecord[] = definitions.map((d) => ({
-    handle,
-    name: d.name,
-    kind: d.kind,
-    startLine: d.startLine,
-    endLine: d.endLine,
-    bodyText: d.bodyText,
-    signature: d.signature,
-    exported: d.exported,
-    lang,
-    createdAt: now,
-  }));
+  for (const result of blockResults) {
+    for (const d of result.definitions) {
+      symRecords.push({
+        handle,
+        name: d.name,
+        kind: d.kind,
+        startLine: d.startLine + result.lineOffset,
+        endLine: d.endLine + result.lineOffset,
+        bodyText: d.bodyText,
+        signature: d.signature,
+        exported: d.exported,
+        lang: info.sourceLang ?? info.lang,
+        createdAt: now,
+      });
+    }
+  }
   store.saveSymbols(handle, symRecords);
 
   // ── 存引用 ──
-  const localNames = new Set(definitions.map((d) => d.name));
-  const refRecords: RefRecord[] = [];
+  const localNames = new Set(blockResults.flatMap((result) => result.definitions.map((d) => d.name)));
+  const allImports = blockResults.flatMap((result) => result.imports);
 
   // calls → call 边
-  for (const c of calls) {
-    const isPlain = !c.calleeName.includes(".");
-    const target = isPlain
-      ? resolveCallTarget(handle, c.calleeName, localNames, imports, importerPath)
-      : { toHandle: undefined as string | undefined };
-    refRecords.push({
-      fromHandle: handle,
-      fromSymbol: c.callerSymbol ?? undefined,
-      toHandle: target.toHandle,
-      toSymbol: c.calleeName,
-      refType: "call",
-      line: c.line,
-      resolved: !!target.toHandle,
-      importSrc: target.importSrc,
-      createdAt: now,
-    });
+  for (const result of blockResults) {
+    for (const c of result.calls) {
+      const isPlain = !c.calleeName.includes(".");
+      const target = isPlain
+        ? resolveCallTarget(handle, c.calleeName, localNames, allImports, importerPath)
+        : { toHandle: undefined as string | undefined };
+      refRecords.push({
+        fromHandle: handle,
+        fromSymbol: c.callerSymbol ?? undefined,
+        toHandle: target.toHandle,
+        toSymbol: c.calleeName,
+        refType: "call",
+        line: c.line + result.lineOffset,
+        resolved: !!target.toHandle,
+        importSrc: target.importSrc,
+        createdAt: now,
+      });
+    }
   }
 
   // imports → import 边(每个导入名一条,便于跨文件符号查找)
-  for (const imp of imports) {
-    const toHandle = resolveImportHandle(importerPath, imp.source);
-    if (imp.importedNames.length === 0) {
-      // 副作用 import(无导入名):存一条占位,to_symbol 用 source 标记
-      refRecords.push({
-        fromHandle: handle,
-        fromSymbol: undefined,
-        toHandle,
-        toSymbol: "(side-effect)",
-        refType: "import",
-        line: imp.line,
-        resolved: !!toHandle,
-        importSrc: imp.source,
-        createdAt: now,
-      });
-    } else {
-      for (const name of imp.importedNames) {
+  for (const result of blockResults) {
+    for (const imp of result.imports) {
+      const toHandle = resolveImportHandle(importerPath, imp.source);
+      if (imp.importedNames.length === 0) {
+        // 副作用 import(无导入名):存一条占位,to_symbol 用 source 标记
         refRecords.push({
           fromHandle: handle,
           fromSymbol: undefined,
           toHandle,
-          toSymbol: name,
+          toSymbol: "(side-effect)",
           refType: "import",
-          line: imp.line,
+          line: imp.line + result.lineOffset,
           resolved: !!toHandle,
           importSrc: imp.source,
           createdAt: now,
         });
+      } else {
+        for (const name of imp.importedNames) {
+          refRecords.push({
+            fromHandle: handle,
+            fromSymbol: undefined,
+            toHandle,
+            toSymbol: name,
+            refType: "import",
+            line: imp.line + result.lineOffset,
+            resolved: !!toHandle,
+            importSrc: imp.source,
+            createdAt: now,
+          });
+        }
       }
     }
   }
@@ -170,6 +365,81 @@ export async function indexCode(handle: string): Promise<boolean> {
 async function ensureIndexed(handle: string): Promise<boolean> {
   if (store.hasSymbols(handle)) return true;
   return indexCode(handle);
+}
+
+// ─── 检索:代码结构图 ──────────────────────────────────────────────────────
+
+/**
+ * 返回一个文件级结构图。对普通 TS/JS 返回符号/导入/调用概览;
+ * 对 Vue SFC 额外返回 template/script/style、组件、事件、绑定。
+ */
+export async function retrieveCodeMap(handle: string): Promise<GraphResult> {
+  const info = codeInfoForHandle(handle);
+  if (!info?.rec) return { text: `❌ handle=${handle} 不存在`, retrieved: false };
+  if (!info.lang && !info.vue) {
+    return {
+      text: `❌ handle=${handle} 非代码文件(来源:${info.rec.source ?? "?"})。可用 tok_retrieve 检索。`,
+      retrieved: false,
+    };
+  }
+
+  if (info.lang) await ensureIndexed(handle);
+  const symbols = store.getSymbols(handle);
+  const source = sourceOf(handle);
+  const lines: string[] = [
+    `代码结构图 handle=${handle}`,
+    `来源: ${source}`,
+    `类型: ${info.vue ? "Vue SFC" : info.sourceLang ?? info.lang ?? "code"}`,
+    "",
+  ];
+
+  if (info.vue) {
+    const vue = info.vue;
+    lines.push("Vue SFC 分区:");
+    lines.push(`  template: ${vue.template ? `行${vue.template.startLine}+` : "无"}`);
+    lines.push(`  script: ${vue.scripts.length} 个${vue.scripts.length ? ` (${vue.scripts.map((s) => `行${s.startLine}${s.lang ? ` lang=${s.lang}` : ""}${s.setup ? " setup" : ""}`).join(", ")})` : ""}`);
+    lines.push(`  style: ${vue.styleCount} 个`);
+    if (vue.components.length) lines.push(`  组件引用: ${vue.components.join(", ")}`);
+    if (vue.events.length) lines.push(`  事件监听: ${vue.events.join(", ")}`);
+    if (vue.bindings.length) lines.push(`  属性/模型绑定: ${vue.bindings.join(", ")}`);
+    if (vue.parseErrors.length) lines.push(`  解析警告: ${vue.parseErrors.slice(0, 3).join("; ")}`);
+    lines.push("");
+  }
+
+  if (symbols.length > 0) {
+    lines.push("符号列表:");
+    for (const s of symbols) {
+      lines.push(`  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${s.signature ?? ""}`);
+    }
+  } else if (info.lang) {
+    lines.push("符号列表: 未提取到函数/类/命名箭头函数。");
+  }
+
+  const callLines: string[] = [];
+  for (const s of symbols) {
+    const refs = store.getReferences(handle, "callees", s.name);
+    if (refs.length === 0) continue;
+    const compact = refs.slice(0, 8).map((r) =>
+      `${r.toSymbol}@${r.line}${r.resolved ? "" : r.importSrc ? `(import:${r.importSrc})` : ""}`
+    ).join(", ");
+    callLines.push(`  ${s.name} -> ${compact}${refs.length > 8 ? ` ... +${refs.length - 8}` : ""}`);
+  }
+  if (callLines.length > 0) {
+    lines.push("");
+    lines.push("调用概览:");
+    lines.push(...callLines);
+  }
+
+  if (info.vue) {
+    lines.push("");
+    lines.push("建议用法:");
+    lines.push(`  - 查结构: tok_code_map(handle="${handle}")`);
+    lines.push(`  - 查符号: tok_code_symbol(handle="${handle}", symbol="方法名")`);
+    lines.push(`  - 查调用: tok_code_refs(handle="${handle}", symbol="方法名", direction="callees")`);
+    lines.push(`  - 查模板片段: tok_retrieve(handle="${handle}", query="组件名或事件名")`);
+  }
+
+  return { text: lines.join("\n"), retrieved: true };
 }
 
 // ─── 检索:符号定义 ──────────────────────────────────────────────────────────
@@ -185,12 +455,11 @@ export async function retrieveSymbol(
   symbol?: string,
   query?: string
 ): Promise<GraphResult> {
-  const rec = store.getOriginal(handle);
-  if (!rec) return { text: `❌ handle=${handle} 不存在`, retrieved: false };
-  const lang = langForHandle(handle);
-  if (!lang) {
+  const info = codeInfoForHandle(handle);
+  if (!info?.rec) return { text: `❌ handle=${handle} 不存在`, retrieved: false };
+  if (!info.lang) {
     return {
-      text: `❌ handle=${handle} 非代码文件(来源:${rec.source ?? "?"})。tok_code_symbol 仅支持 TS/JS。用 tok_retrieve 检索。`,
+      text: `❌ handle=${handle} 非代码文件或无可解析脚本(来源:${info.rec.source ?? "?"})。tok_code_symbol 支持 TS/JS/Vue SFC script。用 tok_retrieve 检索。`,
       retrieved: false,
     };
   }
@@ -291,11 +560,10 @@ export async function retrieveRefs(
   direction: "callers" | "callees",
   depth = 1
 ): Promise<GraphResult> {
-  const rec = store.getOriginal(handle);
-  if (!rec) return { text: `❌ handle=${handle} 不存在`, retrieved: false };
-  const lang = langForHandle(handle);
-  if (!lang) {
-    return { text: `❌ handle=${handle} 非代码文件。tok_code_refs 仅支持 TS/JS。`, retrieved: false };
+  const info = codeInfoForHandle(handle);
+  if (!info?.rec) return { text: `❌ handle=${handle} 不存在`, retrieved: false };
+  if (!info.lang) {
+    return { text: `❌ handle=${handle} 非代码文件或无可解析脚本。tok_code_refs 支持 TS/JS/Vue SFC script。`, retrieved: false };
   }
   if (!(await ensureIndexed(handle))) {
     return { text: `❌ handle=${handle} 索引失败`, retrieved: false };

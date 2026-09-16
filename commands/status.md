@@ -6,7 +6,7 @@ argument-hint: "[可选：指定子目录路径]"
 
 运行诊断脚本获取项目结构:
 
-!bun run "${CLAUDE_PLUGIN_ROOT}/src/diagnose.ts"
+!node "${CLAUDE_PLUGIN_ROOT}/node_modules/tsx/dist/cli.mjs" "${CLAUDE_PLUGIN_ROOT}/src/diagnose.ts"
 
 基于上面脚本的 JSON 输出,按极简文风输出诊断结论。
 

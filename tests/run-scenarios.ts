@@ -5,7 +5,7 @@
  * 顺序跑 5 个场景，每个场景两组(对照组 --bare + 实验组 --plugin-dir)。
  * 运行结束后记录 session JSONL 路径供分析脚本使用。
  *
- * 用法: npx tsx tests/run-scenarios.ts
+ * 用法: node --import tsx tests/run-scenarios.ts
  */
 
 import { spawnSync } from "node:child_process";
@@ -197,7 +197,7 @@ async function main() {
 
   writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2), "utf-8");
   console.log(`\n\n结果已保存: ${RESULTS_FILE}`);
-  console.log("接下来运行: npx tsx tests/analyze-sessions.ts");
+  console.log("接下来运行: node --import tsx tests/analyze-sessions.ts");
 }
 
 main().catch((e) => {

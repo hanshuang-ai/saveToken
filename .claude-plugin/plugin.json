@@ -1,15 +1,15 @@
 {
   "name": "frugal",
   "displayName": "Frugal",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "通用 token 节省插件 —— 内容感知核心 + 可插拔适配器",
   "author": { "name": "lcy" },
   "license": "MIT",
   "keywords": ["token", "efficiency", "context", "compression"],
   "mcpServers": {
     "frugal": {
-      "command": "npx",
-      "args": ["tsx", "${CLAUDE_PLUGIN_ROOT}/src/mcp/server.ts"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/node_modules/tsx/dist/cli.mjs", "${CLAUDE_PLUGIN_ROOT}/src/mcp/server.ts"]
     }
   }
 }

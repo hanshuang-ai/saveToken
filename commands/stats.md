@@ -5,11 +5,11 @@ allowed-tools: Bash
 
 先启动网页面板(后台运行,端口 3721):
 
-!npx tsx "${CLAUDE_PLUGIN_ROOT}/src/dashboard/server.ts" &
+!node "${CLAUDE_PLUGIN_ROOT}/node_modules/tsx/dist/cli.mjs" "${CLAUDE_PLUGIN_ROOT}/src/dashboard/server.ts" &
 
 然后运行统计脚本:
 
-!npx tsx "${CLAUDE_PLUGIN_ROOT}/scripts/frugal-stats.ts"
+!node "${CLAUDE_PLUGIN_ROOT}/node_modules/tsx/dist/cli.mjs" "${CLAUDE_PLUGIN_ROOT}/scripts/frugal-stats.ts"
 
 基于统计脚本的输出,直接展示结果。末尾附一行:
 

@@ -68,6 +68,7 @@ test("real hook stdin and MCP retrieval use isolated storage and leave pass-thro
     const tools = await client.listTools();
     assert.ok(!tools.tools.some((t) => t.name === "tok_compact"));
     assert.ok(tools.tools.some((t) => t.name === "tok_stats"));
+    assert.ok(tools.tools.some((t) => t.name === "tok_code_map"));
     const retrieved = await client.callTool({ name: "tok_retrieve", arguments: { handle } });
     assert.ok(JSON.stringify(retrieved).includes("PASS src/feature-0.test.ts"));
     const readRetrieved = await client.callTool({ name: "tok_retrieve", arguments: { handle: readHandle, query: "value777" } });
@@ -78,6 +79,78 @@ test("real hook stdin and MCP retrieval use isolated storage and leave pass-thro
     assert.ok(JSON.stringify(search).includes("expected"));
     const old = await client.callTool({ name: "tok_retrieve", arguments: { handle: "old-record" } });
     assert.ok(JSON.stringify(old).includes("old original"));
+
+    const tsRaw = `import { audit } from "./audit";
+export function loadStation(id: string) {
+  return audit(id);
+}
+export const saveStation = (id: string) => {
+  return loadStation(id);
+};
+class StationService {
+  refresh(id: string) {
+    return this.reload(id);
+  }
+  reload(id: string) {
+    return saveStation(id);
+  }
+}
+` + "\nexport const filler = 1;".repeat(600);
+    const tsResponse = JSON.parse(run("Read", { filePath: "src/station.ts", content: tsRaw }));
+    const tsView = tsResponse.hookSpecificOutput.updatedToolOutput.content;
+    const tsHandle = /handle="([^"]+)"/.exec(tsView)![1];
+    const tsMap = await client.callTool({ name: "tok_code_map", arguments: { handle: tsHandle } });
+    const tsMapText = JSON.stringify(tsMap);
+    assert.ok(tsMapText.includes("loadStation"));
+    assert.ok(tsMapText.includes("saveStation"));
+    assert.ok(tsMapText.includes("StationService"));
+    assert.ok(tsMapText.includes("refresh"));
+    assert.ok(tsMapText.includes("reload"));
+    const tsSymbol = await client.callTool({ name: "tok_code_symbol", arguments: { handle: tsHandle, symbol: "saveStation" } });
+    assert.ok(JSON.stringify(tsSymbol).includes("loadStation"));
+
+    const vueRaw = `<template>
+  <FuelCard :station="station" :price="price" @select="selectFuel" />
+  <PartnerPanel v-model:visible="partnerVisible" @confirm="confirmPartner" />
+</template>
+<script lang="ts">
+import FuelCard from "./FuelCard.vue";
+import PartnerPanel from "./PartnerPanel.vue";
+const station = "demo";
+const price = 7.42;
+let partnerVisible = false;
+function fromOptionsScript() {
+  return "classic";
+}
+</script>
+<script setup lang="ts">
+function selectFuel(id: string) {
+  return confirmPartner(id);
+}
+function confirmPartner(id: string) {
+  partnerVisible = true;
+  return id;
+}
+</script>
+<style scoped>
+.page { color: #333; }
+</style>
+` + "\n<!-- filler -->".repeat(900);
+    const vueResponse = JSON.parse(run("Read", { filePath: "src/pages/detail/detail.vue", content: vueRaw }));
+    const vueView = vueResponse.hookSpecificOutput.updatedToolOutput.content;
+    const vueHandle = /handle="([^"]+)"/.exec(vueView)![1];
+    const codeMap = await client.callTool({ name: "tok_code_map", arguments: { handle: vueHandle } });
+    const codeMapText = JSON.stringify(codeMap);
+    assert.ok(codeMapText.includes("Vue SFC"));
+    assert.ok(codeMapText.includes("FuelCard"));
+    assert.ok(codeMapText.includes("PartnerPanel"));
+    assert.ok(codeMapText.includes("select"));
+    assert.ok(codeMapText.includes("confirm"));
+    assert.ok(codeMapText.includes("visible"));
+    assert.ok(codeMapText.includes("selectFuel"));
+    assert.ok(codeMapText.includes("fromOptionsScript"));
+    const symbol = await client.callTool({ name: "tok_code_symbol", arguments: { handle: vueHandle, symbol: "selectFuel" } });
+    assert.ok(JSON.stringify(symbol).includes("confirmPartner"));
   } finally {
     store.close();
     await client?.close();

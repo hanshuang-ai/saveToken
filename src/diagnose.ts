@@ -7,7 +7,7 @@
  * 设计原则:
  * - 只读,不改任何文件
  * - 轻量(深度 2),排除常见噪声目录
- * - 无依赖,纯 Bun 标准库
+ * - 无运行时依赖,纯 Node 标准库
  */
 
 import { readdirSync, statSync, existsSync } from "node:fs";
@@ -39,9 +39,9 @@ const EXCLUDED_DIRS = new Set([
 
 /** 代码项目标记文件 → 子类型映射 */
 const CODE_MARKERS: Record<string, string> = {
-  "package.json": "node-bun",
-  "tsconfig.json": "node-bun",
-  "bun.lockb": "bun",
+  "package.json": "node",
+  "tsconfig.json": "node",
+  "package-lock.json": "node",
   "Cargo.toml": "rust",
   "go.mod": "go",
   "pyproject.toml": "python",

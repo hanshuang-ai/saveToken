@@ -1,7 +1,7 @@
 /**
  * dashboard/server.ts — Frugal 压缩统计面板(网页)
  *
- * 启动: npx tsx src/dashboard/server.ts
+ * 启动: node --import tsx src/dashboard/server.ts
  * 访问: http://localhost:3721
  * API:  http://localhost:3721/api/data
  */

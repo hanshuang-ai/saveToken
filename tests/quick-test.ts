@@ -6,7 +6,7 @@
  *   2. 压缩比
  *   3. 往返校验(compress→decompress 语义等价)
  *
- * 用法: npx tsx tests/quick-test.ts
+ * 用法: node --import tsx tests/quick-test.ts
  */
 
 import { classify } from "../src/core/classifier.ts";

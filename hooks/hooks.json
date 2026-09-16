@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npx --prefix \"${CLAUDE_PLUGIN_ROOT}\" --no-install tsx \"${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-compress.ts\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/node_modules/tsx/dist/cli.mjs\" \"${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-compress.ts\"",
             "timeout": 30
           }
         ]

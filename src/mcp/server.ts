@@ -22,7 +22,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { store } from "../store/db";
-import { retrieveSymbol, retrieveRefs } from "../codegraph/graph";
+import { retrieveCodeMap, retrieveSymbol, retrieveRefs } from "../codegraph/graph";
 
 // ─── 数据目录与 store 初始化 ──────────────────────────────────────────────────
 // 与 hook 脚本用同一份数据库,故路径逻辑保持一致。
@@ -149,7 +149,7 @@ function tokStats(): string {
 // ─── MCP server ────────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "frugal", version: "0.0.4" },
+  { name: "frugal", version: "0.0.5" },
   { capabilities: { tools: {} } }
 );
 
@@ -192,9 +192,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "tok_code_map",
+      description:
+        "查看已有持久化代码 handle 的文件级结构图。TS/JS 返回符号与调用概览; Vue SFC 额外返回 template/script/style 分区、组件引用、事件与绑定。适合代码重构前先理解结构。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          handle: {
+            type: "string",
+            description: "代码原文句柄(压缩结果里的 handle=orig-N 或 h-...)",
+          },
+        },
+        required: ["handle"],
+      },
+    },
+    {
       name: "tok_code_symbol",
       description:
-        "查询已有持久化代码 handle 的符号定义及实现。handle + symbol 精确取符号,handle + query 模糊查找,仅传 handle 列符号。仅支持 TS/JS;不改变 Read 输出。",
+        "查询已有持久化代码 handle 的符号定义及实现。handle + symbol 精确取符号,handle + query 模糊查找,仅传 handle 列符号。支持 TS/JS,Vue SFC 会解析 script/script setup;不改变 Read 输出。",
       inputSchema: {
         type: "object",
         properties: {
@@ -217,7 +232,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tok_code_refs",
       description:
-        "查询已有持久化 TS/JS 代码 handle 的调用关系:callers 为调用方,callees 为被调用方。跨文件解析依赖已存代码,不改变 Read 输出。",
+        "查询已有持久化代码 handle 的调用关系:callers 为调用方,callees 为被调用方。支持 TS/JS/Vue SFC script;跨文件解析依赖已存代码,不改变 Read 输出。",
       inputSchema: {
         type: "object",
         properties: {
@@ -259,6 +274,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       text = r.text;
       // 仅当模型实际取回原文内容(命中/按行取到/全文)才累加取回计数。
       // 未命中、超大提示、错误不计。
+      if (r.retrieved && args.handle) {
+        try {
+          store.incrementRetrieved(String(args.handle));
+        } catch {
+          // ignore
+        }
+      }
+    } else if (name === "tok_code_map") {
+      const r = await retrieveCodeMap(String(args.handle ?? ""));
+      text = r.text;
       if (r.retrieved && args.handle) {
         try {
           store.incrementRetrieved(String(args.handle));

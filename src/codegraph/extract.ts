@@ -1,23 +1,32 @@
 /**
- * extract.ts —— 从 AST 提取符号定义/导入/调用(仅 MCP)
+ * extract.ts —— 用 ts-morph 提取 TS/JS 符号、导入、调用(仅 MCP)
  *
- * 用手动遍历而非 tree-sitter query:query 的字段名(type_identifier vs identifier)、
- * 包裹节点(export_statement)、跨语言差异(TS/JS/TSX)需逐案调 S 表达式,
- * 手动递归遍历 namedChildren + childForFieldName 更可控、跨语言一致。
- *
- * 参考 CodeGraph "提取"阶段 + Aider 符号签名思路:
- *   - 定义提取完整 body(主符号取回用)+ 精简 signature(引用符号取回用,控 token)
- *   - 调用记录 callerSymbol(栈顶)便于建 callers/callees 边
- *   - import 记 source + importedNames,供 graph.ts 跨文件解析
+ * 原则:语法/语义基础能力优先交给成熟开源库。这里使用 ts-morph
+ * 包装 TypeScript Compiler API,本文件只负责把结果裁剪成插件的轻量图谱模型。
  */
 
-import type { AstNode } from "./parser";
+import {
+  Node,
+  Project,
+  ScriptKind,
+  ScriptTarget,
+  SyntaxKind,
+  type CallExpression,
+  type ClassDeclaration,
+  type FunctionDeclaration,
+  type ImportDeclaration,
+  type MethodDeclaration,
+  type Node as MorphNode,
+  type SourceFile,
+  type VariableDeclaration,
+} from "ts-morph";
+import type { CodeLang } from "./languages";
 
 /** 符号定义 */
 export interface Definition {
   name: string;
   kind: "function" | "class" | "method" | "variable";
-  startLine: number; // 1-based,对齐原文行号
+  startLine: number; // 1-based,对齐当前代码片段行号
   endLine: number;
   bodyText: string; // 完整实现(主符号取回用)
   signature: string; // 精简签名(引用符号取回用)
@@ -26,8 +35,8 @@ export interface Definition {
 
 /** import 信息 */
 export interface ImportInfo {
-  importedNames: string[]; // 命名/默认导入名;空=副作用 import
-  source: string; // 源字符串原始值(如 ./fileB,已去引号)
+  importedNames: string[]; // 命名/默认/namespace 导入名;空=副作用 import
+  source: string; // 源字符串原始值(如 ./fileB)
   line: number;
 }
 
@@ -44,30 +53,43 @@ export interface ExtractResult {
   calls: CallInfo[];
 }
 
-// ─── 辅助 ────────────────────────────────────────────────────────────────────
+let sourceSeq = 0;
 
-const DEF_TYPES = new Set([
-  "function_declaration",
-  "class_declaration",
-  "method_definition",
-]);
-
-/** 取节点名字段(兼容 identifier / type_identifier) */
-function nodeName(node: AstNode): string {
-  return node.childForFieldName("name")?.text ?? "";
+function scriptKindForLang(lang: CodeLang): ScriptKind {
+  if (lang === "tsx") return ScriptKind.TSX;
+  if (lang === "jsx") return ScriptKind.JSX;
+  if (lang === "javascript") return ScriptKind.JS;
+  return ScriptKind.TS;
 }
 
-/** 取节点起始行(1-based) */
-function startLine(node: AstNode): number {
-  return node.startPosition.row + 1;
+function createSourceFile(code: string, lang: CodeLang, sourcePath?: string): SourceFile {
+  const project = new Project({
+    useInMemoryFileSystem: true,
+    compilerOptions: {
+      allowJs: true,
+      checkJs: false,
+      jsx: lang === "tsx" ? 4 : undefined,
+      target: ScriptTarget.Latest,
+    },
+  });
+  const ext = lang === "tsx" ? "tsx" : lang === "jsx" ? "jsx" : lang === "javascript" ? "js" : "ts";
+  const path = sourcePath && /\.[cm]?[jt]sx?$/.test(sourcePath)
+    ? sourcePath
+    : `/virtual/frugal-${++sourceSeq}.${ext}`;
+  return project.createSourceFile(path, code, {
+    overwrite: true,
+    scriptKind: scriptKindForLang(lang),
+  });
 }
 
-/**
- * 构造精简签名:取 body 之前的声明头。
- * - function/method/class:第一个 `{` 之前
- * - 箭头/变量:第一个 `=>` 之前
- * 文本切分法,不依赖字段名,跨 TS/JS/TSX 一致。
- */
+function startLine(node: MorphNode): number {
+  return node.getSourceFile().getLineAndColumnAtPos(node.getStart()).line;
+}
+
+function endLine(node: MorphNode): number {
+  return node.getSourceFile().getLineAndColumnAtPos(node.getEnd()).line;
+}
+
 function makeSignature(text: string): string {
   const brace = text.indexOf("{");
   const arrow = text.indexOf("=>");
@@ -75,150 +97,148 @@ function makeSignature(text: string): string {
   if (brace >= 0 && (arrow < 0 || brace < arrow)) cut = brace;
   else if (arrow >= 0) cut = arrow;
   if (cut > 0) return text.slice(0, cut).trim().replace(/[\s;]+$/, "");
-  // 单行无 body(罕见):取首行
   return text.split("\n")[0].trim();
 }
 
-/** 去字符串字面量的引号 */
-function stripQuotes(s: string): string {
-  if (s.length >= 2) {
-    const f = s[0];
-    const l = s[s.length - 1];
-    if ((f === '"' && l === '"') || (f === "'" && l === "'") || (f === "`" && l === "`")) {
-      return s.slice(1, -1);
-    }
-  }
-  return s;
+function hasExportModifier(node: MorphNode): boolean {
+  return Node.isModifierable(node) &&
+    node.getModifiers().some((modifier) => modifier.getKind() === SyntaxKind.ExportKeyword);
 }
 
-// ─── 提取 ────────────────────────────────────────────────────────────────────
+function definitionFromFunction(node: FunctionDeclaration): Definition | undefined {
+  const name = node.getName();
+  if (!name) return undefined;
+  const text = node.getText();
+  return {
+    name,
+    kind: "function",
+    startLine: startLine(node),
+    endLine: endLine(node),
+    bodyText: text,
+    signature: makeSignature(text),
+    exported: hasExportModifier(node),
+  };
+}
 
-/**
- * 从 AST 根节点提取定义/导入/调用。
- * @param rootNode parseCode 返回的根节点
- */
-export function extractSymbols(rootNode: AstNode | null): ExtractResult {
+function definitionFromClass(node: ClassDeclaration): Definition | undefined {
+  const name = node.getName();
+  if (!name) return undefined;
+  const text = node.getText();
+  return {
+    name,
+    kind: "class",
+    startLine: startLine(node),
+    endLine: endLine(node),
+    bodyText: text,
+    signature: makeSignature(text),
+    exported: hasExportModifier(node),
+  };
+}
+
+function definitionFromMethod(node: MethodDeclaration): Definition | undefined {
+  const name = node.getName();
+  if (!name) return undefined;
+  const text = node.getText();
+  return {
+    name,
+    kind: "method",
+    startLine: startLine(node),
+    endLine: endLine(node),
+    bodyText: text,
+    signature: makeSignature(text),
+    exported: hasExportModifier(node.getFirstAncestorByKind(SyntaxKind.ClassDeclaration) ?? node),
+  };
+}
+
+function definitionFromVariable(node: VariableDeclaration): Definition | undefined {
+  const initializer = node.getInitializer();
+  if (!initializer || (!Node.isArrowFunction(initializer) && !Node.isFunctionExpression(initializer))) {
+    return undefined;
+  }
+  const name = node.getName();
+  const text = node.getText();
+  return {
+    name,
+    kind: "variable",
+    startLine: startLine(node),
+    endLine: endLine(node),
+    bodyText: text,
+    signature: makeSignature(text),
+    exported: Boolean(node.getVariableStatement()?.hasExportKeyword()),
+  };
+}
+
+function importInfoFromDeclaration(node: ImportDeclaration): ImportInfo {
+  const clause = node.getImportClause();
+  const importedNames: string[] = [];
+  const defaultImport = clause?.getDefaultImport()?.getText();
+  if (defaultImport) importedNames.push(defaultImport);
+  const namespaceImport = clause?.getNamespaceImport()?.getText();
+  if (namespaceImport) importedNames.push(namespaceImport);
+  for (const named of clause?.getNamedImports() ?? []) {
+    const alias = named.getAliasNode()?.getText();
+    importedNames.push(alias ?? named.getName());
+  }
+  return {
+    importedNames,
+    source: node.getModuleSpecifierValue(),
+    line: startLine(node),
+  };
+}
+
+function callerNameFor(node: MorphNode): string | null {
+  let current: MorphNode | undefined = node;
+  while ((current = current.getParent())) {
+    if (Node.isFunctionDeclaration(current)) return current.getName() ?? null;
+    if (Node.isMethodDeclaration(current)) return current.getName();
+    if (Node.isVariableDeclaration(current)) {
+      const initializer = current.getInitializer();
+      if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
+        return current.getName();
+      }
+    }
+  }
+  return null;
+}
+
+function calleeNameFor(node: CallExpression): string {
+  const expression = node.getExpression();
+  if (Node.isPropertyAccessExpression(expression)) {
+    const objectText = expression.getExpression().getText();
+    const prop = expression.getName();
+    if (objectText === "this" || objectText === "super") return prop;
+    return `${objectText}.${prop}`;
+  }
+  return expression.getText();
+}
+
+export function extractSymbols(code: string, lang: CodeLang, sourcePath?: string): ExtractResult {
+  const sourceFile = createSourceFile(code, lang, sourcePath);
   const definitions: Definition[] = [];
-  const imports: ImportInfo[] = [];
+  const imports = sourceFile.getImportDeclarations().map(importInfoFromDeclaration);
   const calls: CallInfo[] = [];
-  if (!rootNode) return { definitions, imports, calls };
 
-  // 调用方符号栈:进入函数/方法/箭头时压名,退出弹;记录调用时取栈顶
-  const stack: string[] = [];
-
-  function walk(node: AstNode): void {
-    // ── 定义:函数/类/方法 ──
-    if (DEF_TYPES.has(node.type)) {
-      const name = nodeName(node);
-      if (name) {
-        const kind =
-          node.type === "function_declaration"
-            ? "function"
-            : node.type === "class_declaration"
-              ? "class"
-              : "method";
-        definitions.push({
-          name,
-          kind,
-          startLine: startLine(node),
-          endLine: node.endPosition.row + 1,
-          bodyText: node.text,
-          signature: makeSignature(node.text),
-          exported: (node as any).parent?.type === "export_statement",
-        });
-        stack.push(name);
-        for (const c of node.namedChildren) walk(c);
-        stack.pop();
-        return;
-      }
+  sourceFile.forEachDescendant((node) => {
+    if (Node.isFunctionDeclaration(node)) {
+      const def = definitionFromFunction(node);
+      if (def) definitions.push(def);
+    } else if (Node.isClassDeclaration(node)) {
+      const def = definitionFromClass(node);
+      if (def) definitions.push(def);
+    } else if (Node.isMethodDeclaration(node)) {
+      const def = definitionFromMethod(node);
+      if (def) definitions.push(def);
+    } else if (Node.isVariableDeclaration(node)) {
+      const def = definitionFromVariable(node);
+      if (def) definitions.push(def);
+    } else if (Node.isCallExpression(node)) {
+      calls.push({
+        calleeName: calleeNameFor(node),
+        callerSymbol: callerNameFor(node),
+        line: startLine(node),
+      });
     }
+  });
 
-    // ── 定义:命名箭头函数 / const f = function ...
-    //  lexical_declaration → variable_declarator(name, value=arrow_function/function)
-    if (node.type === "variable_declarator") {
-      const value = node.childForFieldName("value");
-      if (value && (value.type === "arrow_function" || value.type === "function_expression")) {
-        const name = nodeName(node); // variable_declarator 的 name 字段
-        if (name) {
-          definitions.push({
-            name,
-            kind: "variable",
-            startLine: startLine(node),
-            endLine: node.endPosition.row + 1,
-            bodyText: node.text,
-            signature: makeSignature(node.text),
-            exported: (node as any).parent?.parent?.type === "export_statement",
-          });
-          stack.push(name);
-          for (const c of node.namedChildren) walk(c);
-          stack.pop();
-          return;
-        }
-      }
-    }
-
-    // ── import ──
-    if (node.type === "import_statement") {
-      const info = parseImport(node);
-      if (info) imports.push(info);
-      // import 内部无定义/调用,不递归
-      return;
-    }
-
-    // ── 调用 ──
-    if (node.type === "call_expression") {
-      const fn = node.childForFieldName("function");
-      if (fn) {
-        let calleeName = fn.text;
-        // this.X() / super.X() → 裸名 X。同类方法调用是最常见模式,
-        // 存成 "this.X" 全名会让 callers 按裸名查不到;改存裸名 X 可解析到本文件定义。
-        // 其它成员调用(obj.X / store.getOriginal)仍存全名,标成员调用未解析(需类型信息才能跨文件)。
-        if (fn.type === "member_expression") {
-          const obj = fn.childForFieldName("object");
-          const prop = fn.childForFieldName("property");
-          if (obj && prop && (obj.text === "this" || obj.text === "super")) {
-            calleeName = prop.text;
-          }
-        }
-        calls.push({
-          calleeName,
-          callerSymbol: stack.length > 0 ? stack[stack.length - 1] : null,
-          line: startLine(node),
-        });
-      }
-      // 调用参数里可能还有调用 f(g(x)),递归进去
-    }
-
-    // 递归子节点
-    for (const c of node.namedChildren) walk(c);
-  }
-
-  walk(rootNode);
   return { definitions, imports, calls };
-}
-
-/** 解析 import_statement → {importedNames, source, line} */
-function parseImport(node: AstNode): ImportInfo | null {
-  let source = "";
-  const names: string[] = [];
-  for (const child of node.namedChildren) {
-    if (child.type === "string") {
-      source = stripQuotes(child.text);
-    } else {
-      // import_clause 的子树:收集所有 identifier(导入名)
-      collectIdentifiers(child, names);
-    }
-  }
-  if (!source) return null;
-  return { importedNames: names, source, line: startLine(node) };
-}
-
-/** 递归收集 identifier 节点的文本(跳过 string/keyword) */
-function collectIdentifiers(node: AstNode, out: string[]): void {
-  if (node.type === "identifier") {
-    out.push(node.text);
-    return;
-  }
-  // namespace_import (* as ns) 里的 ns 是 identifier;named_imports 里 import_specifier.name
-  for (const c of node.namedChildren) collectIdentifiers(c, out);
 }
