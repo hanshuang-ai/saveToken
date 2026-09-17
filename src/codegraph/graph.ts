@@ -13,6 +13,8 @@
  * 查询前 ensureIndexed:查 symbols 表有无记录,无则触发 indexCode。
  */
 
+import { createHash } from "node:crypto";
+import { readFileSync, existsSync } from "node:fs";
 import { store } from "../store/db";
 import type { SymbolRecord, RefRecord } from "../store/db";
 import { extractSymbols } from "./extract";
@@ -68,8 +70,8 @@ interface SymbolViewOptions {
 const MAX_MAP_SYMBOLS = 80;
 const MAX_MAP_CALL_ROWS = 40;
 const MAX_FUZZY_SYMBOLS = 20;
-const DEFAULT_SYMBOL_BODY_CHARS = 1200;
-const MAX_SYMBOL_BODY_CHARS = 4000;
+const DEFAULT_SYMBOL_BODY_CHARS = 8000;
+const MAX_SYMBOL_BODY_CHARS = 16000;
 const MAX_REFS_PER_SYMBOL = 20;
 const MAX_REF_LINES = 80;
 
@@ -398,6 +400,30 @@ async function ensureIndexed(handle: string): Promise<boolean> {
   return indexCode(handle);
 }
 
+// ─── 文件路径直接索引 ──────────────────────────────────────────────────────────
+
+/**
+ * 从文件路径读取、生成 handle、存储原文、索引代码。
+ * 返回 handle 供后续 tok_code_map/tok_code_symbol/tok_code_refs 使用。
+ * 这是 MCP 工具的入口:模型传 filePath,无需 Read 被压缩即可用代码图工具。
+ */
+export async function ensureFileIndexed(filePath: string): Promise<string> {
+  const abs = filePath.replace(/\\/g, "/");
+  if (!existsSync(abs)) {
+    throw new Error(`文件不存在: ${abs}`);
+  }
+  const content = readFileSync(abs, "utf8");
+  const handle = "h-" + createHash("sha256").update(abs).update(content).digest("hex").slice(0, 24);
+
+  if (store.hasSymbols(handle)) return handle;
+
+  const now = Date.now();
+  const ext = abs.slice(abs.lastIndexOf(".") + 1).toLowerCase();
+  store.saveOriginalWithHandle(handle, content, { source: abs, tool: "Read" }, now);
+  await indexCode(handle);
+  return handle;
+}
+
 // ─── 检索:代码结构图 ──────────────────────────────────────────────────────
 
 /**
@@ -441,7 +467,7 @@ export async function retrieveCodeMap(handle: string): Promise<GraphResult> {
     lines.push("符号列表:");
     const { shown, omitted } = cappedList(symbols, MAX_MAP_SYMBOLS);
     for (const s of shown) {
-      lines.push(`  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} — ${oneLine(s.signature)}`);
+      lines.push(`  [${s.kind}] ${s.name} 行${s.startLine}-${s.endLine}${s.exported ? " (exported)" : ""} (${(s.bodyText ?? "").length}字符) — ${oneLine(s.signature)}`);
     }
     if (omitted) lines.push(`  ... 另有 ${omitted} 个符号省略,可用 tok_code_symbol(handle="${handle}", query="关键词") 精查`);
   } else if (info.lang) {
@@ -570,11 +596,16 @@ function formatSymbol(handle: string, sym: SymbolRecord, src: string, options: S
   if (options.includeBody) {
     const budget = normalizeBodyBudget(options.maxBodyChars);
     const body = sym.bodyText ?? sym.signature ?? "";
-    lines.push(`实现预览${body.length > budget ? `(前 ${budget} 字符)` : ""}:`);
-    lines.push(body.length > budget ? `${body.slice(0, budget).trimEnd()}\n[frugal: implementation truncated; use tok_retrieve(handle="${handle}", startLine=${sym.startLine}, count=${Math.min(160, Math.max(1, sym.endLine - sym.startLine + 1))}) for exact code]` : body);
+    if (body.length > budget) {
+      lines.push(`实现预览(前 ${budget}/${body.length} 字符):`);
+      lines.push(`${body.slice(0, budget).trimEnd()}\n[frugal: 实现被截断,可用 tok_code_symbol(handle="${handle}", symbol="${sym.name}", includeBody=true, maxBodyChars=${Math.min(MAX_SYMBOL_BODY_CHARS, body.length)}) 获取完整实现]`);
+    } else {
+      lines.push(`实现(完整 ${body.length} 字符):`);
+      lines.push(body);
+    }
   } else {
-    const count = Math.min(160, Math.max(1, sym.endLine - sym.startLine + 1));
-    lines.push(`实现未内联。需要源码时用: tok_retrieve(handle="${handle}", startLine=${sym.startLine}, count=${count})`);
+    const bodyLen = (sym.bodyText ?? "").length;
+    lines.push(`实现未内联${bodyLen > 0 ? `(约 ${bodyLen} 字符)` : ""}。需要源码时用: tok_code_symbol(handle="${handle}", symbol="${sym.name}", includeBody=true)`);
   }
   lines.push("");
 

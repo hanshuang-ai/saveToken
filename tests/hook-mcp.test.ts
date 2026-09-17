@@ -23,28 +23,34 @@ test("real hook stdin and MCP retrieval use isolated storage and leave pass-thro
   };
   let client: Client | undefined;
   try {
-    assert.equal(run("Read", { content: "const x = 'a  b';\n".repeat(10) }), "");
-    assert.equal(run("Bash", { stdout: "INFO memory=173MB\n".repeat(10), image: "x".repeat(20000) }), "");
+    assert.equal(run("Read", { type: "text", file: { filePath: "src/small.ts", content: "const x = 'a  b';\n".repeat(10), numLines: 10, startLine: 1, totalLines: 10 } }), "");
+    assert.equal(run("Bash", { stdout: "INFO memory=173MB\n".repeat(10), stderr: "", interrupted: false, isImage: false, noOutputExpected: false }), "");
     assert.equal(existsSync(join(data, "frugal.db")), false);
     const readRaw = Array.from({ length: 1000 }, (_, i) => `export const value${i} = ${i};`).join("\n");
-    const readResponse = JSON.parse(run("Read", {
-      filePath: "src/large.ts",
-      content: readRaw,
-      metadata: { content: readRaw },
-    }));
-    const readView = readResponse.hookSpecificOutput.updatedToolOutput.content;
+    const readResponseText = run("Read", {
+      type: "text",
+      file: { filePath: "src/large.ts", content: readRaw, numLines: 1000, startLine: 1, totalLines: 1000 },
+    });
+    const readParsed = JSON.parse(readResponseText);
+    const readView = readParsed.hookSpecificOutput.updatedToolOutput.file.content;
     const readHandle = /handle="([^"]+)"/.exec(readView)![1];
-    assert.ok(readView.includes("generic preview"));
+    assert.ok(readView.includes("code outline"));
+    assert.ok(readView.includes("tok_code_map"));
     assert.ok(readView.length < readRaw.length);
-    assert.equal(readResponse.hookSpecificOutput.updatedToolOutput.metadata.content, readRaw);
+    // sibling file metadata is never rewritten; only file.content carries the placeholder.
+    assert.equal(readParsed.hookSpecificOutput.updatedToolOutput.file.filePath, "src/large.ts");
+    assert.equal(readParsed.hookSpecificOutput.updatedToolOutput.file.numLines, 1000);
+    assert.ok(existsSync(join(data, "frugal.db")));
 
     const raw = Array.from({ length: 500 }, (_, i) => `PASS src/feature-${i}.test.ts`).join("\n") +
       '\nFAIL src/broken.test.ts\n  expected: "a  b"\n    at fail (test.ts:1:1)\nTest Suites: 1 failed, 500 passed, 501 total\nTests: 1 failed, 500 passed, 501 total';
-    const response = JSON.parse(run("Bash", { stdout: raw, stderr: "", code: 1 }));
+    const response = JSON.parse(run("Bash", { stdout: raw, stderr: "", interrupted: false, isImage: false, noOutputExpected: false }));
     const view = response.hookSpecificOutput.updatedToolOutput.stdout;
     const handle = /handle="([^"]+)"/.exec(view)![1];
     assert.ok(view.includes('expected: "a  b"'));
-    assert.equal(response.hookSpecificOutput.updatedToolOutput.code, 1);
+    // non-text fields pass through untouched alongside the rewritten stdout.
+    assert.equal(response.hookSpecificOutput.updatedToolOutput.isImage, false);
+    assert.equal(response.hookSpecificOutput.updatedToolOutput.stderr, "");
     const telemetry = readFileSync(timing, "utf8");
     assert.ok(!telemetry.includes("expected:"));
     const records = telemetry.trim().split("\n").map((s) => JSON.parse(s));
@@ -56,6 +62,8 @@ test("real hook stdin and MCP retrieval use isolated storage and leave pass-thro
     assert.equal(store.getOriginalText(readHandle), readRaw);
     assert.equal(store.getRecentMetrics()[0].compressedSize, view.length);
     store.saveOriginalWithHandle("old-record", "old original", {}, 1);
+    const longLine = "a".repeat(11999) + "😀" + "b".repeat(13000) + "最后";
+    store.saveOriginalWithHandle("long-line", longLine, {}, 1);
     store.close();
 
     client = new Client({ name: "frugal-local-test", version: "1" });
@@ -71,8 +79,6 @@ test("real hook stdin and MCP retrieval use isolated storage and leave pass-thro
     assert.ok(tools.tools.some((t) => t.name === "tok_code_map"));
     const retrieved = await client.callTool({ name: "tok_retrieve", arguments: { handle } });
     assert.ok(JSON.stringify(retrieved).includes("PASS src/feature-0.test.ts"));
-    const readRetrieved = await client.callTool({ name: "tok_retrieve", arguments: { handle: readHandle, query: "value777" } });
-    assert.ok(JSON.stringify(readRetrieved).includes("value777"));
     const lines = await client.callTool({ name: "tok_retrieve", arguments: { handle, startLine: 501, count: 3 } });
     assert.ok(JSON.stringify(lines).includes("FAIL src/broken.test.ts"));
     const search = await client.callTool({ name: "tok_retrieve", arguments: { handle, query: "expected" } });
@@ -80,6 +86,27 @@ test("real hook stdin and MCP retrieval use isolated storage and leave pass-thro
     const old = await client.callTool({ name: "tok_retrieve", arguments: { handle: "old-record" } });
     assert.ok(JSON.stringify(old).includes("old original"));
 
+    // Exercise the public MCP cursor, not just the pure page helper.
+    let restored = "";
+    let offsetChars = 0;
+    for (let page = 0; page < 10; page++) {
+      const result = await client.callTool({ name: "tok_retrieve", arguments: {
+        handle: "long-line", startLine: 1, count: 1, offsetChars,
+      } });
+      assert.ok(!result.isError);
+      const text = (result.content as { type: string; text: string }[])[0].text;
+      const body = text.slice(text.indexOf("\n\n") + 2);
+      assert.ok(body.length <= 12000);
+      restored += body;
+      const cursor = /"offsetChars":(\d+)/.exec(text.split("\n\n")[0]);
+      if (!cursor) break;
+      assert.ok(Number(cursor[1]) > offsetChars);
+      offsetChars = Number(cursor[1]);
+    }
+    assert.equal(restored, longLine);
+
+    // Codegraph runs against the original the Read hook persisted under its
+    // derived handle; the long-running MCP process runs ts-morph / Vue compiler.
     const tsRaw = `import { audit } from "./audit";
 export function loadStation(id: string) {
   return audit(id);
@@ -96,9 +123,10 @@ class StationService {
   }
 }
 ` + "\nexport const filler = 1;".repeat(600);
-    const tsResponse = JSON.parse(run("Read", { filePath: "src/station.ts", content: tsRaw }));
-    const tsView = tsResponse.hookSpecificOutput.updatedToolOutput.content;
+    const tsResponse = JSON.parse(run("Read", { type: "text", file: { filePath: "src/station.ts", content: tsRaw, numLines: tsRaw.split("\n").length, startLine: 1, totalLines: tsRaw.split("\n").length } }));
+    const tsView = tsResponse.hookSpecificOutput.updatedToolOutput.file.content;
     const tsHandle = /handle="([^"]+)"/.exec(tsView)![1];
+    assert.ok(tsView.includes("code outline"));
     const tsMap = await client.callTool({ name: "tok_code_map", arguments: { handle: tsHandle } });
     const tsMapText = JSON.stringify(tsMap);
     assert.ok(tsMapText.includes("loadStation"));
@@ -140,9 +168,10 @@ function confirmPartner(id: string) {
 .page { color: #333; }
 </style>
 ` + "\n<!-- filler -->".repeat(900);
-    const vueResponse = JSON.parse(run("Read", { filePath: "src/pages/detail/detail.vue", content: vueRaw }));
-    const vueView = vueResponse.hookSpecificOutput.updatedToolOutput.content;
+    const vueResponse = JSON.parse(run("Read", { type: "text", file: { filePath: "src/pages/detail/detail.vue", content: vueRaw, numLines: vueRaw.split("\n").length, startLine: 1, totalLines: vueRaw.split("\n").length } }));
+    const vueView = vueResponse.hookSpecificOutput.updatedToolOutput.file.content;
     const vueHandle = /handle="([^"]+)"/.exec(vueView)![1];
+    assert.ok(vueView.includes("code outline"));
     const codeMap = await client.callTool({ name: "tok_code_map", arguments: { handle: vueHandle } });
     const codeMapText = JSON.stringify(codeMap);
     assert.ok(codeMapText.includes("Vue SFC"));

@@ -1,6 +1,18 @@
 {
-  "description": "frugal: conservative Bash/Read output views with committed original retrieval",
+  "description": "frugal: conservative Bash output compression + SessionStart guidance for code-graph tools",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/node_modules/tsx/dist/cli.mjs\" \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start-guidance.ts\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash|Read",

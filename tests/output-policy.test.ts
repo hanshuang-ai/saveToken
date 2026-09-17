@@ -79,7 +79,7 @@ test("timestamped vehicle logs and repeated CPU snapshots produce useful views",
   assert.equal(classify({ text: snapshot, tool: "Bash" }).type, "structured");
 });
 
-test("general large outputs get a recoverable preview while low-level compress stays conservative", () => {
+test("unknown large outputs pass through without generic sampling, with or without source", async () => {
   const samples = [
     Array.from({ length: 1000 }, (_, i) => `2026-09-15 12:00 INFO memory=${i}MB cpu=${i % 100}`).join("\n"),
     JSON.stringify(Array.from({ length: 500 }, (_, i) => ({ id: i, value: "a  b" })), null, 2),
@@ -88,34 +88,37 @@ test("general large outputs get a recoverable preview while low-level compress s
     `${passes}\nERROR a general log is not a Jest report`,
   ];
   for (const text of samples) {
-    const candidate = planOutput(text, meta).candidate;
-    assert.ok(candidate);
-    assert.ok(candidate.text.includes(`tok_retrieve(handle="${candidate.handle}")`));
-    assert.ok(candidate.text.length < text.length);
+    assert.equal((await planOutput(text, meta)).candidate, null);
+    assert.equal((await planOutput(text, { tool: "Bash" })).candidate, null);
+    assert.equal((await planOutput(text, { ...meta, tool: "Read" })).candidate, null);
     assert.equal(compress(text).text, text);
   }
 });
 
-test("Jest candidate includes marker in savings, uses scoped stable handles", () => {
-  const a = planOutput(jest, meta).candidate!;
+test("Jest candidate includes marker in savings, uses scoped stable handles", async () => {
+  const a = (await planOutput(jest, meta)).candidate!;
   assert.ok(a);
   assert.ok(a.text.length <= jest.length * 0.9);
   assert.ok(a.text.includes(`tok_retrieve(handle="${a.handle}")`));
-  assert.deepEqual(planOutput(jest, meta).candidate, a);
-  assert.notEqual(planOutput(jest, { ...meta, sessionId: "other" }).candidate!.handle, a.handle);
-  assert.notEqual(planOutput(jest, { ...meta, source: "/other" }).candidate!.handle, a.handle);
-  assert.ok(planOutput(jest, { ...meta, tool: "Read", source: "/work/result.log" }).candidate);
+  assert.deepEqual((await planOutput(jest, meta)).candidate, a);
+  assert.notEqual((await planOutput(jest, { ...meta, sessionId: "other" })).candidate!.handle, a.handle);
+  assert.notEqual((await planOutput(jest, { ...meta, source: "/other" })).candidate!.handle, a.handle);
+  assert.equal((await planOutput(jest, { ...meta, tool: "Read", source: "/work/result.log" })).candidate, null);
 });
 
-test("threshold and binary gates still prevent unsafe compression", () => {
-  assert.equal(planOutput("x".repeat(9999), meta).candidate, null);
+test("threshold and binary gates still prevent unsafe compression", async () => {
+  const report = Array.from({ length: 140 }, (_, i) => `PASS src/f${i}.test.ts`).join("\n") + "\n" + summary;
+  assert.ok(report.length < 4999);
+  assert.equal((await planOutput(report.padEnd(4999), meta)).candidate, null);
+  assert.ok((await planOutput(report.padEnd(5000), meta)).candidate?.method.includes("jest-pass"));
   const tinySaving = "\x1b[31m" + "value=123;\n".repeat(2000) + "\x1b[0m";
-  assert.ok(planOutput(tinySaving, meta).candidate?.method.includes("generic-preview"));
-  assert.equal(planOutput(jest + "\x00", meta).candidate, null);
+  assert.equal((await planOutput(tinySaving, meta)).candidate, null);
+  assert.equal((await planOutput(jest + "\x00", meta)).candidate, null);
 });
 
-test("hook persists before emission, handles Bash and Read text, ignores metadata, fails open", async () => {
-  const response = { stdout: jest, stderr: "", image: jest, metadata: { text: jest }, exitCode: 1 };
+test("hook persists Bash and Read code outline before emission, preserves non-text fields, fails open", async () => {
+  // Real Claude Code Bash tool_result (toolUseResult).
+  const response = { stdout: jest, stderr: "", interrupted: false, isImage: false, noOutputExpected: false };
   const originals: string[] = [];
   let writes = 0;
   const persisted = async (original: string, metric: any) => {
@@ -127,34 +130,75 @@ test("hook persists before emission, handles Bash and Read text, ignores metadat
   const result = await rewriteToolResponse(response, meta, persisted);
   assert.equal(writes, 1);
   assert.equal(result.changed, true);
-  assert.equal((result.value as any).image, jest);
-  assert.equal((result.value as any).exitCode, 1);
+  // non-text fields pass through untouched alongside the rewritten stdout.
+  assert.equal((result.value as any).stderr, "");
+  assert.equal((result.value as any).isImage, false);
+  assert.equal((result.value as any).noOutputExpected, false);
   assert.equal(response.stdout, jest);
   const failed = await rewriteToolResponse(response, meta, () => { throw new Error("disk full"); });
   assert.equal(failed.value, response);
   assert.equal(failed.changed, false);
   assert.equal(failed.measurements[0].reason, "failed-open");
   const readText = Array.from({ length: 1000 }, (_, i) => `export const value${i} = ${i};`).join("\n");
-  const readResponse = { filePath: "/work/src/large.ts", content: readText, metadata: { content: readText } };
+  // Real Claude Code Read tool_result (toolUseResult).
+  const readResponse = {
+    type: "text",
+    file: { filePath: "/work/src/large.ts", content: readText, numLines: 1000, startLine: 1, totalLines: 1000 },
+  };
   const readResult = await rewriteToolResponse(readResponse, { ...meta, tool: "Read" }, persisted);
   assert.equal(readResult.changed, true);
-  assert.ok((readResult.value as any).content.includes("generic preview"));
-  assert.equal((readResult.value as any).metadata.content, readText);
-  assert.equal(readResponse.content, readText);
-  const nestedRead = { file: { filePath: "/work/data.txt", content: readText }, ok: true };
+  const readView = (readResult.value as any).file.content;
+  assert.ok(readView.includes("code outline"));
+  assert.ok(readView.includes(`tok_code_map(handle="`));
+  assert.ok(readView.length < readText.length);
+  // sibling file metadata and the original response object are never mutated.
+  assert.equal((readResult.value as any).file.filePath, "/work/src/large.ts");
+  assert.equal((readResult.value as any).file.numLines, 1000);
+  assert.equal(readResponse.file.content, readText);
+  const nestedRead = {
+    type: "text",
+    file: { filePath: "/work/data.txt", content: readText, numLines: 1000, startLine: 1, totalLines: 1000 },
+    ok: true,
+  };
   const nestedResult = await rewriteToolResponse(nestedRead, { ...meta, tool: "Read" }, persisted);
-  assert.equal(nestedResult.changed, true);
-  assert.ok((nestedResult.value as any).file.content.includes("generic preview"));
+  assert.equal(nestedResult.changed, false);
+  assert.equal(nestedResult.value, nestedRead);
   assert.equal(nestedRead.file.content, readText);
   assert.equal((await rewriteToolResponse("small", meta, persisted)).changed, false);
-  assert.equal(writes, 3);
-  assert.deepEqual(originals, [jest, readText, readText]);
+  assert.equal(writes, 2);
+  assert.deepEqual(originals, [jest, readText]);
 });
 
-test("backup/index/metric commit atomically, collision and failed metrics roll back", () => {
+test("log windows merge and retain complete diagnostic continuation blocks", () => {
+  const lines = Array.from({ length: 180 }, (_, i) => `2026-09-16 12:00:00 INFO tick=${i}`);
+  lines[40] = "2026-09-16 12:00:00 ERROR failed request";
+  lines[42] = "2026-09-16 12:00:00 WARN retry pending";
+  const stack = ["Traceback (most recent call last):", ...Array.from({ length: 12 }, (_, i) => `  frame-${i}: request handler`), "RuntimeError: request rejected"];
+  lines.splice(43, 0, ...stack);
+  const raw = lines.join("\n");
+  const view = structuredDigestCompress(raw);
+  assert.ok(view.compressed);
+  const expected = lines.slice(37, 46 + stack.length).join("\n");
+  assert.ok(view.text.includes(expected));
+  assert.equal((view.text.match(/tick=39/g) ?? []).length, 1);
+  assert.equal((view.text.match(/\[original lines/g) ?? []).length, 1);
+  assert.ok(!view.text.includes("tick=0\n"));
+});
+
+test("too many signals and dense diagnostics are never replaced by generic preview", async () => {
+  for (const interval of [10, 2]) {
+    const raw = Array.from({ length: 1000 }, (_, i) =>
+      `2026-09-16 12:00:00 ${i % interval === 0 ? "ERROR" : "INFO"} request=${i}`
+    ).join("\n");
+    assert.equal(structuredDigestCompress(raw).compressed, false);
+    assert.equal((await planOutput(raw, meta)).candidate, null);
+  }
+});
+
+test("backup/index/metric commit atomically, collision and failed metrics roll back", async () => {
   store.open();
   try {
-    const candidate = planOutput(jest, meta).candidate!;
+    const candidate = (await planOutput(jest, meta)).candidate!;
     const metric = {
       ...meta, handle: candidate.handle, contentType: "structured" as const,
       originalSize: jest.length, compressedSize: candidate.text.length,

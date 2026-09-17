@@ -3,8 +3,10 @@ import type { Compressed } from "../core/types";
 export interface DigestOptions {
   /** Minimum number of non-empty lines before a digest is considered. */
   minLines?: number;
-  /** Maximum number of log signal lines shown in the view. */
+  /** Above this signal count, pass through instead of dropping diagnostics. */
   maxSignalLines?: number;
+  /** Neighboring original lines retained around every diagnostic block. */
+  contextLines?: number;
   /** Maximum number of table rows retained per repeated snapshot section. */
   maxRowsPerSection?: number;
 }
@@ -12,6 +14,7 @@ export interface DigestOptions {
 const DEFAULTS: Required<DigestOptions> = {
   minLines: 40,
   maxSignalLines: 80,
+  contextLines: 3,
   maxRowsPerSection: 5,
 };
 
@@ -110,14 +113,29 @@ function digestTimestampedLog(
   const density = entries.length / Math.max(1, nonEmpty.length);
   // Dense diagnostics are already information-dense; keeping only signal lines
   // would not be a useful view of the failure.
-  if (entries.length === 0 || density > 0.35) return noop(input);
+  if (entries.length === 0 || density > 0.35 || entries.length > opts.maxSignalLines) return noop(input);
 
-  const shown = entries.slice(0, opts.maxSignalLines);
-  const omitted = entries.length - shown.length;
+  // Keep complete continuation blocks (including unrecognized stack frames),
+  // then merge neighboring windows in original, zero-based line coordinates.
+  const context = Number.isFinite(opts.contextLines) ? Math.max(0, Math.trunc(opts.contextLines)) : DEFAULTS.contextLines;
+  const ranges: { start: number; end: number }[] = [];
+  for (const entry of entries) {
+    const index = entry.line - 1;
+    let blockEnd = index;
+    while (blockEnd + 1 < lines.length && !LOG_LINE_PREFIX.test(lines[blockEnd + 1])) blockEnd++;
+    const start = Math.max(0, index - context);
+    const end = Math.min(lines.length - 1, blockEnd + context);
+    const previous = ranges[ranges.length - 1];
+    if (previous && start <= previous.end + 1) previous.end = Math.max(previous.end, end);
+    else ranges.push({ start, end });
+  }
   const tally = `errors=${counts.err}, warnings=${counts.warn}, failures=${counts.fail}, summaries=${counts.summary}, stacks=${counts.stack}`;
   const view = [
-    `[frugal: log digest; ${shown.length}/${entries.length} signal lines retained; ${tally}${omitted > 0 ? `; ${omitted} more signal lines available in the original` : ""}]`,
-    ...shown.map((entry) => `[L${entry.line}] ${entry.text}`),
+    `[frugal: log digest; all ${entries.length} signal lines and diagnostic context retained; ${tally}]`,
+    ...ranges.flatMap(({ start, end }) => [
+      `[original lines ${start + 1}-${end + 1}]`,
+      ...lines.slice(start, end + 1),
+    ]),
   ].join("\n");
   if (view.length >= input.length) return noop(input);
   return {

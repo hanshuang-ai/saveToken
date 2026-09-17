@@ -22,25 +22,32 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { store } from "../store/db";
-import { retrieveCodeMap, retrieveSymbol, retrieveRefs } from "../codegraph/graph";
+import { retrieveCodeMap, retrieveSymbol, retrieveRefs, ensureFileIndexed } from "../codegraph/graph";
+import { linePage, MAX_RETRIEVE_CHARS, MAX_RETRIEVE_LINE_COUNT } from "./line-page";
+import { trace, getTraceLogPath } from "../core/logger";
 
 // ─── 数据目录与 store 初始化 ──────────────────────────────────────────────────
-// 与 hook 脚本用同一份数据库,故路径逻辑保持一致。
 const DATA = process.env.FRUGAL_DATA_DIR ?? join(homedir(), "Desktop", "frugal");
 const DB_PATH = join(DATA, "frugal.db");
+
+// ─── 统一日志:所有组件写到同一 trace 文件 ────────────────────────────────────
+function log(msg: string, data?: Record<string, unknown>): void {
+  trace("MCP", msg, data);
+}
+log(`server module loaded`, { DATA, DB_PATH, traceLog: getTraceLogPath() });
 
 try {
   if (!existsSync(DATA)) mkdirSync(DATA, { recursive: true });
   store.open(DB_PATH);
-} catch {
-  // store 打不开时,工具调用会返回错误提示,但不崩进程
+  log(`store opened OK`, { DB_PATH });
+} catch (e) {
+  log(`store.open FAILED: ${String((e as Error).message)}`);
 }
 
 /** 全文取回的安全上限:超过此字符数提示模型用 query/startLine 精确取,而非倾倒全文 */
 const MAX_FULL_TEXT = 60000;
 const QUERY_HIT_LIMIT = 5;
 const MAX_SEARCH_SNIPPET_CHARS = 700;
-const MAX_RETRIEVE_LINE_COUNT = 160;
 
 function clampText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
@@ -54,6 +61,7 @@ interface RetrieveArgs {
   query?: string;
   startLine?: number;
   count?: number;
+  offsetChars?: number;
 }
 
 /** 取回结果:text 为给模型看的内容;retrieved 表示是否实际取回了原文内容(命中/按行/全文) */
@@ -63,7 +71,7 @@ interface RetrieveResult {
 }
 
 function tokRetrieve(args: RetrieveArgs): RetrieveResult {
-  const { handle, query, startLine, count } = args;
+  const { handle, query, startLine, count, offsetChars } = args;
   if (!handle) return { text: "❌ 缺少 handle 参数", retrieved: false };
 
   const exists = store.getOriginal(handle);
@@ -85,12 +93,19 @@ function tokRetrieve(args: RetrieveArgs): RetrieveResult {
   }
 
   // 模式2:按行号取片段 —— startLine + count
-  if (startLine != null && count != null) {
-    const safeCount = Math.max(1, Math.min(Math.trunc(count), MAX_RETRIEVE_LINE_COUNT));
-    const chunk = store.getLines(handle, startLine, safeCount);
-    if (!chunk) return { text: `❌ handle=${handle} 取行失败`, retrieved: false };
-    const capped = safeCount < count ? `\n[frugal: requested ${count} lines, capped to ${safeCount}; repeat with a later startLine if needed]` : "";
-    return { text: `handle=${handle} 第 ${startLine}~${startLine + safeCount - 1} 行:${capped}\n\n${chunk}`, retrieved: true };
+  if (startLine != null || count != null || offsetChars != null) {
+    if (startLine == null || count == null) throw new Error("startLine and count must be provided together");
+    const page = linePage(exists.content, startLine, count, offsetChars);
+    if (!page) return { text: `❌ handle=${handle} 行号或字符偏移超出范围`, retrieved: false };
+    const next = page.nextOffsetChars != null
+      ? `\n[frugal: range continues; tok_retrieve(${JSON.stringify({ handle, startLine, count, offsetChars: page.nextOffsetChars })})]`
+      : count > MAX_RETRIEVE_LINE_COUNT && page.nextStartLine != null
+        ? `\n[frugal: line limit reached; tok_retrieve(${JSON.stringify({ handle, startLine: page.nextStartLine, count: count - MAX_RETRIEVE_LINE_COUNT })})]`
+        : "";
+    return {
+      text: `handle=${handle} 原文第 ${page.startLine}~${page.endLine} 行的片段(UTF-16 字符偏移 ${page.offsetChars},本次 ${page.text.length} 字符):${next}\n\n${page.text}`,
+      retrieved: page.text.length > 0,
+    };
   }
 
   // 模式3:取完整原文 —— 超大时提示改用检索/按行,避免又把巨量内容塞回上下文(违背省 token 初衷)
@@ -156,7 +171,17 @@ function tokStats(): string {
   ].join("\n");
 }
 
-// ─── MCP server ────────────────────────────────────────────────────────────────
+/** Resolve handle from args: use provided handle, or read + index via filePath. */
+async function resolveHandle(args: Record<string, unknown>): Promise<string> {
+  const handle = args.handle != null ? String(args.handle) : "";
+  const filePath = args.filePath != null ? String(args.filePath) : "";
+  if (!handle && !filePath) throw new Error("需要 handle 或 filePath 参数");
+  if (handle) return handle;
+  log(`ensureFileIndexed BEFORE path=${filePath}`);
+  const h = await ensureFileIndexed(filePath);
+  log(`ensureFileIndexed AFTER handle=${h}`);
+  return h;
+}
 
 const server = new Server(
   { name: "frugal", version: "0.0.5" },
@@ -168,7 +193,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tok_retrieve",
       description:
-        "按指定 handle(如 orig-1)取回已存原文。用 query 检索,或 startLine + count 按行取;仅传 handle 取全文(有大小上限)。",
+        `按指定 handle 取回已存原文。query 检索,或 startLine + count 按行取(最多 ${MAX_RETRIEVE_LINE_COUNT} 行、${MAX_RETRIEVE_CHARS} 字符);超长行按返回的 offsetChars 续读同一行范围。仅传 handle 取全文(上限 ${MAX_FULL_TEXT} 字符)。`,
       inputSchema: {
         type: "object",
         properties: {
@@ -188,6 +213,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "可选:取的行数,配合 startLine 使用",
           },
+          offsetChars: {
+            type: "integer",
+            minimum: 0,
+            description: "可选:所请求行范围内的 UTF-16 字符偏移(从 0 开始)。续读时保持 startLine/count 不变,使用上次返回的偏移。",
+          },
         },
         required: ["handle"],
       },
@@ -204,7 +234,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tok_code_map",
       description:
-        "查看已有持久化代码 handle 的文件级结构图。TS/JS 返回符号与调用概览; Vue SFC 额外返回 template/script/style 分区、组件引用、事件与绑定。适合代码重构前先理解结构。",
+        "【优先于 Read】代码文件(.ts/.js/.vue/.tsx/.jsx)结构图。传 filePath(绝对路径)即可,自动读取+索引。返回符号列表、调用概览;Vue SFC 返回 template/script/style 分区、组件引用、事件绑定。理解代码时必须先用此工具,而非直接 Read 整个文件——Read 大文件浪费大量 token。Edit 前需精确文本时再用 Read 或 tok_retrieve 按行取。",
       inputSchema: {
         type: "object",
         properties: {
@@ -212,20 +242,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "代码原文句柄(压缩结果里的 handle=orig-N 或 h-...)",
           },
+          filePath: {
+            type: "string",
+            description: "代码文件绝对路径。与 handle 二选一;传此参数会自动读取文件、索引并返回结构图。",
+          },
         },
-        required: ["handle"],
       },
     },
     {
       name: "tok_code_symbol",
       description:
-        "查询已有持久化代码 handle 的符号定义及实现。handle + symbol 精确取符号,handle + query 模糊查找,仅传 handle 列符号。支持 TS/JS,Vue SFC 会解析 script/script setup;不改变 Read 输出。",
+        "【优先于 Read】查询代码文件的符号定义及实现。传 filePath(绝对路径)即可,自动读取+索引。精确查 symbol 或模糊 query 匹配。支持 TS/JS,Vue SFC 解析 script/setup。理解函数/类/方法时用此工具,而非 Read 整个文件。includeBody=true 可内联实现(有字符上限)。",
       inputSchema: {
         type: "object",
         properties: {
           handle: {
             type: "string",
             description: "代码原文句柄(压缩结果里的 handle=orig-N)",
+          },
+          filePath: {
+            type: "string",
+            description: "代码文件绝对路径。与 handle 二选一;自动读取文件并索引。",
           },
           symbol: {
             type: "string",
@@ -237,26 +274,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           includeBody: {
             type: "boolean",
-            description: "可选:是否内联符号实现。默认 false,建议先看签名/调用关系,再用 tok_retrieve 按行取必要片段。",
+            description: "可选:是否内联符号完整实现。设为 true 可直接获取方法/函数的完整代码,无需再用 tok_retrieve 按行取。默认 false(仅看签名和调用关系时用)。",
           },
           maxBodyChars: {
             type: "number",
-            description: "可选:includeBody=true 时的实现字符上限,默认 1200,最大 4000。",
+            description: "可选:includeBody=true 时的实现字符上限,默认 8000,最大 16000。绝大多数方法/函数在 8000 字符内可完整返回。",
           },
         },
-        required: ["handle"],
       },
     },
     {
       name: "tok_code_refs",
       description:
-        "查询已有持久化代码 handle 的调用关系:callers 为调用方,callees 为被调用方。支持 TS/JS/Vue SFC script;跨文件解析依赖已存代码,不改变 Read 输出。",
+        "【优先于 Read】查询代码文件的调用关系。传 filePath(绝对路径)即可,自动读取+索引。callers=谁调用了本符号,callees=本符号调用了谁。支持 TS/JS/Vue SFC script。分析依赖关系时用此工具,而非 Read 整个文件去人工找调用。",
       inputSchema: {
         type: "object",
         properties: {
           handle: {
             type: "string",
             description: "代码原文句柄(orig-N)",
+          },
+          filePath: {
+            type: "string",
+            description: "代码文件绝对路径。与 handle 二选一;自动读取文件并索引。",
           },
           symbol: {
             type: "string",
@@ -272,7 +312,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: "可选:callees 递归深度(默认1,最大3)",
           },
         },
-        required: ["handle", "symbol", "direction"],
+        required: ["symbol", "direction"],
       },
     },
   ],
@@ -280,38 +320,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
+  const argSummary = JSON.stringify({
+    handle: args.handle,
+    filePath: args.filePath,
+    query: args.query,
+    startLine: args.startLine,
+    count: args.count,
+    offsetChars: args.offsetChars,
+    symbol: args.symbol,
+    direction: args.direction,
+    depth: args.depth,
+  });
+  log(`ENTER ${name} ${argSummary}`);
   try {
     let text: string;
     if (name === "tok_retrieve") {
+      log(`tokRetrieve BEFORE`);
       const r = tokRetrieve({
         handle: String(args.handle ?? ""),
         query: args.query != null ? String(args.query) : undefined,
         startLine: args.startLine != null ? Number(args.startLine) : undefined,
         count: args.count != null ? Number(args.count) : undefined,
+        offsetChars: args.offsetChars != null ? Number(args.offsetChars) : undefined,
       });
+      log(`tokRetrieve AFTER retrieved=${r.retrieved} textLen=${r.text.length}`);
       text = r.text;
       // 仅当模型实际取回原文内容(命中/按行取到/全文)才累加取回计数。
       // 未命中、超大提示、错误不计。
       if (r.retrieved && args.handle) {
+        log(`incrementRetrieved BEFORE`);
         try {
           store.incrementRetrieved(String(args.handle));
-        } catch {
-          // ignore
+          log(`incrementRetrieved AFTER`);
+        } catch (e) {
+          log(`incrementRetrieved THREW ${String((e as Error).message)}`);
         }
       }
     } else if (name === "tok_code_map") {
-      const r = await retrieveCodeMap(String(args.handle ?? ""));
+      log(`tok_code_map BEFORE`);
+      const handle = await resolveHandle(args);
+      log(`retrieveCodeMap BEFORE handle=${handle}`);
+      const r = await retrieveCodeMap(handle);
+      log(`retrieveCodeMap AFTER retrieved=${r.retrieved} textLen=${r.text.length}`);
       text = r.text;
-      if (r.retrieved && args.handle) {
-        try {
-          store.incrementRetrieved(String(args.handle));
-        } catch {
-          // ignore
-        }
+      if (r.retrieved) {
+        try { store.incrementRetrieved(handle); } catch {}
       }
     } else if (name === "tok_code_symbol") {
+      log(`tok_code_symbol BEFORE`);
+      const handle = await resolveHandle(args);
       const r = await retrieveSymbol(
-        String(args.handle ?? ""),
+        handle,
         args.symbol != null ? String(args.symbol) : undefined,
         args.query != null ? String(args.query) : undefined,
         {
@@ -319,38 +378,38 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           maxBodyChars: args.maxBodyChars != null ? Number(args.maxBodyChars) : undefined,
         }
       );
+      log(`retrieveSymbol AFTER retrieved=${r.retrieved} textLen=${r.text.length}`);
       text = r.text;
-      if (r.retrieved && args.handle) {
-        try {
-          store.incrementRetrieved(String(args.handle));
-        } catch {
-          // ignore
-        }
+      if (r.retrieved) {
+        try { store.incrementRetrieved(handle); } catch {}
       }
     } else if (name === "tok_code_refs") {
+      log(`tok_code_refs BEFORE`);
+      const handle = await resolveHandle(args);
       const direction = String(args.direction ?? "callees") as "callers" | "callees";
       const depth = args.depth != null ? Number(args.depth) : 1;
+      log(`retrieveRefs BEFORE`);
       const r = await retrieveRefs(
-        String(args.handle ?? ""),
+        handle,
         String(args.symbol ?? ""),
         direction,
         depth
       );
+      log(`retrieveRefs AFTER retrieved=${r.retrieved} textLen=${r.text.length}`);
       text = r.text;
-      if (r.retrieved && args.handle) {
-        try {
-          store.incrementRetrieved(String(args.handle));
-        } catch {
-          // ignore
-        }
+      if (r.retrieved) {
+        try { store.incrementRetrieved(handle); } catch {}
       }
     } else if (name === "tok_stats") {
       text = tokStats();
+      log(`tokStats textLen=${text.length}`);
     } else {
       throw new Error(`未知工具: ${name}`);
     }
+    log(`EXIT ${name} respLen=${text.length}`);
     return { content: [{ type: "text", text }] };
   } catch (e) {
+    log(`HANDLER THREW ${name} ${String((e as Error).message)}`);
     return {
       content: [{ type: "text", text: `❌ 工具调用失败 (${name}): ${(e as Error).message}` }],
       isError: true,
@@ -360,5 +419,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // 直接运行 → 启动 stdio server;被 import 测试时不启动(避免抢占 stdin)
 if (!process.env.FRUGAL_MCP_TEST) {
+  log(`connecting StdioServerTransport`);
   await server.connect(new StdioServerTransport());
+  log(`connected; idle, awaiting tool calls`);
 }

@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SaveToken 运行原理</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            line-height: 1.8;
+            color: #333;
+            background: #f5f7fa;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 50px;
+        }
+
+        header h1 {
+            font-size: 2.2em;
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+
+        header p {
+            font-size: 1.1em;
+            color: #666;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        }
+
+        .card h2 {
+            font-size: 1.5em;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #667eea;
+        }
+
+        .card h3 {
+            font-size: 1.1em;
+            color: #34495e;
+            margin: 20px 0 10px 0;
+        }
+
+        .highlight-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px 30px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+
+        .highlight-box h3 {
+            color: white;
+            margin-top: 0;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            margin: 20px 0;
+        }
+
+        .stat-item {
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+
+        .stat-number {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #667eea;
+            display: block;
+        }
+
+        .stat-label {
+            font-size: 0.9em;
+            color: #666;
+        }
+
+        .list-check {
+            list-style: none;
+            padding: 0;
+        }
+
+        .list-check li {
+            padding: 8px 0;
+            padding-left: 28px;
+            position: relative;
+        }
+
+        .list-check li::before {
+            content: '✓';
+            position: absolute;
+            left: 0;
+            color: #27ae60;
+            font-weight: bold;
+        }
+
+        .comparison {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px 0;
+        }
+
+        .comparison-item {
+            padding: 20px;
+            border-radius: 8px;
+        }
+
+        .comparison-item.good {
+            background: #d4edda;
+            border-left: 4px solid #27ae60;
+        }
+
+        .comparison-item.bad {
+            background: #f8d7da;
+            border-left: 4px solid #e74c3c;
+        }
+
+        .comparison-item h4 {
+            margin-bottom: 10px;
+        }
+
+        .gate-list {
+            counter-reset: gate;
+        }
+
+        .gate-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 15px;
+            padding: 15px;
+            margin: 10px 0;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+
+        .gate-number {
+            background: #667eea;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            flex-shrink: 0;
+        }
+
+        .gate-content strong {
+            display: block;
+            color: #2c3e50;
+            margin-bottom: 4px;
+        }
+
+        .gate-content p {
+            color: #666;
+            font-size: 0.95em;
+        }
+
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: #999;
+            font-size: 0.9em;
+        }
+
+        /* ───── 流程图 ───────────────────────────────────── */
+        .flow-diagram {
+            background: #fafbfc;
+            border-radius: 14px;
+            padding: 36px 24px;
+            margin: 24px 0 8px;
+            border: 1px solid #e8ecf0;
+        }
+
+        .flow-title {
+            text-align: center;
+            font-size: 1.05em;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            color: #2c3e50;
+            margin-bottom: 8px;
+        }
+
+        .flow-subtitle {
+            text-align: center;
+            font-size: 0.82em;
+            color: #9aa3b2;
+            margin-bottom: 30px;
+        }
+
+        .pipeline {
+            position: relative;
+            width: 100%;
+            max-width: 720px;
+            margin: 0 auto;
+        }
+
+        /* 主轴竖线（穿过所有 stage 中央） */
+        .pipeline::before {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 18px;
+            bottom: 18px;
+            width: 2px;
+            background: linear-gradient(180deg, #90caf9 0%, #667eea 25%, #667eea 75%, #81c784 100%);
+            transform: translateX(-50%);
+            border-radius: 2px;
+        }
+
+        .stage {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: stretch;
+            margin-bottom: 26px;
+            z-index: 1;
+        }
+
+        .stage:last-child {
+            margin-bottom: 0;
+        }
+
+        .node {
+            position: relative;
+            background: white;
+            border-radius: 12px;
+            padding: 14px 20px 14px 22px;
+            min-width: 330px;
+            max-width: 380px;
+            box-shadow: 0 4px 14px rgba(80, 95, 130, 0.10);
+            border: 1px solid #eaedf2;
+            border-left: 4px solid #667eea;
+        }
+
+        .node .node-title {
+            font-weight: 600;
+            font-size: 0.98em;
+            color: #2c3e50;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .node .node-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: #667eea;
+            flex-shrink: 0;
+        }
+
+        .node .node-note {
+            font-size: 0.8em;
+            color: #7a8494;
+            margin-top: 4px;
+            line-height: 1.55;
+        }
+
+        .node-input {
+            border-left-color: #42a5f5;
+        }
+        .node-input .node-dot { background: #42a5f5; }
+
+        .node-classify {
+            border-left-color: #ff9800;
+        }
+        .node-classify .node-dot { background: #ff9800; }
+
+        .node-strip {
+            border-left-color: #667eea;
+        }
+
+        .node-digest {
+            border-left-color: #667eea;
+            background: #f6f7ff;
+        }
+
+        .node-preview {
+            border-left-color: #ab47bc;
+        }
+        .node-preview .node-dot { background: #ab47bc; }
+
+        .node-gate {
+            border-left-color: #ff7043;
+        }
+        .node-gate .node-dot { background: #ff7043; }
+
+        .node-store {
+            border-left-color: #8e44ad;
+        }
+        .node-store .node-dot { background: #8e44ad; }
+
+        .node-output {
+            border-left-color: #26a69a;
+        }
+        .node-output .node-dot { background: #26a69a; }
+
+        .node-tool {
+            border-left-color: #f9a825;
+        }
+        .node-tool .node-dot { background: #f9a825; }
+
+        .node-egress {
+            border: 1px dashed #c4ccd8;
+            border-left: 4px solid #b0b8c5;
+            background: #f4f6f9;
+            min-width: 178px;
+            max-width: 188px;
+            box-shadow: none;
+        }
+
+        .node-egress .node-title {
+            color: #8893a3;
+            font-weight: 500;
+        }
+
+        .node-egress .node-dot { background: #b0b8c5; }
+
+        /* 分支行：主轴节点 + 右侧放行出口 */
+        .stage.branch {
+            position: relative;
+        }
+
+        .branch-row {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            width: 100%;
+        }
+
+        .branch-main {
+            position: relative;
+            z-index: 2;
+        }
+
+        .egress-conn {
+            position: absolute;
+            top: 50%;
+            left: calc(50% + 190px);
+            width: 60px;
+            border-top: 2px dashed #c4ccd8;
+            transform: translateY(-50%);
+            z-index: 1;
+        }
+
+        .egress-conn::after {
+            content: '▶';
+            position: absolute;
+            right: -5px;
+            top: -9px;
+            color: #b0b8c5;
+            font-size: 0.85em;
+        }
+
+        .egress-side {
+            position: absolute;
+            top: 50%;
+            left: calc(50% + 250px);
+            transform: translateY(-50%);
+            z-index: 2;
+            width: 188px;
+        }
+
+        /* 标签气泡（分支说明） */
+        .branch-tag {
+            position: absolute;
+            top: -24px;
+            left: calc(50% + 210px);
+            font-size: 0.72em;
+            color: #8893a3;
+            background: white;
+            border: 1px solid #e0e4ec;
+            padding: 2px 10px;
+            border-radius: 10px;
+            white-space: nowrap;
+            z-index: 3;
+        }
+
+        /* 双路摘要判定（digest 命中 / 不中→preview） */
+        .stage.fork {
+            margin-bottom: 18px;
+        }
+        .fork-nodes {
+            display: flex;
+            justify-content: center;
+            gap: 28px;
+            position: relative;
+            z-index: 2;
+        }
+        .fork-nodes .node {
+            min-width: 240px;
+            max-width: 260px;
+        }
+        .fork-tag {
+            text-align: center;
+            font-size: 0.74em;
+            color: #9aa3b2;
+            margin: 8px 0 14px;
+        }
+        .fork-tag span {
+            background: white;
+            border: 1px solid #e0e4ec;
+            padding: 2px 12px;
+            border-radius: 12px;
+            margin: 0 6px;
+        }
+
+        /* 图例 */
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 22px;
+            margin-top: 34px;
+            flex-wrap: wrap;
+            padding-top: 22px;
+            border-top: 1px solid #eef1f5;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.82em;
+            color: #6b7484;
+        }
+
+        .legend-color {
+            width: 14px;
+            height: 14px;
+            border-radius: 4px;
+            border: 1px solid #e6e9ee;
+        }
+
+        .legend-color.dashed {
+            border-style: dashed;
+            border-color: #c4ccd8;
+            background: #f4f6f9;
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            .comparison {
+                grid-template-columns: 1fr;
+            }
+            .node {
+                min-width: 0;
+                max-width: 100%;
+                width: 100%;
+            }
+            .egress-conn, .egress-side, .branch-tag {
+                position: static;
+                transform: none;
+                margin: 8px auto 0;
+            }
+            .egress-conn {
+                width: 40px;
+            }
+            .fork-nodes {
+                flex-direction: column;
+                gap: 14px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>SaveToken 运行原理</h1>
+            <p>为 Claude Code 的 Bash / Read 文本输出提供保守精简视图，需用时按 handle 取回原文</p>
+        </header>
+
+        <!-- 解决什么问题 -->
+        <div class="card">
+            <h2>解决什么问题</h2>
+            <p>Claude Code 执行命令或读文件时，会产生大量文本输出（日志、命令结果、文件内容等）。这些输出全部进入上下文，消耗大量 Token。</p>
+
+            <div class="highlight-box">
+                <h3>核心思路</h3>
+                <p>拦截 Bash / Read 的长文本输出，生成可定位原文的<strong>精简视图</strong>并落盘备份；需要细节时再用 MCP 工具按 handle 取回。不命中安全门槛的输出原样放行、不留任何痕迹。</p>
+            </div>
+
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <span class="stat-number">10000</span>
+                    <span class="stat-label">字符阈值（低于此不进管道）</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-number">6000</span>
+                    <span class="stat-label">通用预览字符上限</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-number">100%</span>
+                    <span class="stat-label">采用压缩的原文可完整取回</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 系统架构与工作流程 -->
+        <div class="card">
+            <h2>系统架构与工作流程</h2>
+
+            <div class="flow-diagram">
+                <div class="flow-title">处理流程</div>
+                <div class="flow-subtitle">PostToolUse Hook · 单线性主轴 · 三处放行出口</div>
+
+                <div class="pipeline">
+                    <!-- 1. 输入 -->
+                    <div class="stage">
+                        <div class="node node-input">
+                            <div class="node-title"><span class="node-dot"></span> Bash / Read 工具文本输出</div>
+                            <div class="node-note">只拦这两个工具：Bash 的 <code>stdout</code>/<code>stderr</code>，Read 的 <code>content</code>/<code>text</code>/<code>file.content</code>。图片与元数据不动。</div>
+                        </div>
+                    </div>
+
+                    <!-- 2. 资格检查（带放行出口） -->
+                    <div class="stage branch">
+                        <div class="branch-row">
+                            <div class="branch-main">
+                                <div class="node node-gate">
+                                    <div class="node-title"><span class="node-dot"></span> 资格检查</div>
+                                    <div class="node-note">工具白名单 · 字符 ≥ 10000 · 非二进制（含 NUL 即判缺格）</div>
+                                </div>
+                            </div>
+                            <span class="branch-tag">不满足</span>
+                            <div class="egress-conn"></div>
+                            <div class="egress-side">
+                                <div class="node node-egress">
+                                    <div class="node-title"><span class="node-dot"></span> 原样放行</div>
+                                    <div class="node-note">不存原文 · 不加 handle 标记</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 3. 分类 -->
+                    <div class="stage">
+                        <div class="node node-classify">
+                            <div class="node-title"><span class="node-dot"></span> 内容分类</div>
+                            <div class="node-note">扩展名快筛 / 二进制检测 / 内容启发式 → <code>structured</code> / <code>prose</code> / <code>mixed</code>。分类只决定能否走语义摘要，不决定压不压。</div>
+                        </div>
+                    </div>
+
+                    <!-- 4. 格式剥离 -->
+                    <div class="stage">
+                        <div class="node node-strip">
+                            <div class="node-title"><span class="node-dot"></span> 格式剥离 format-strip</div>
+                            <div class="node-note">对所有类型统一执行，仅移除 SGR ANSI 颜色 / 样式码。不动空白、制表符、光标控制序列。</div>
+                        </div>
+                    </div>
+
+                    <!-- 5. 摘要判定（双路） -->
+                    <div class="stage fork">
+                        <div class="fork-tag">
+                            <span>仅 structured 尝试摘要</span><span>否则</span>
+                        </div>
+                        <div class="fork-nodes">
+                            <div class="node node-digest">
+                                <div class="node-title"><span class="node-dot"></span> structured-digest 摘要</div>
+                                <div class="node-note">严格识别三类：Jest 成功套件、带时间戳的日志信号行、重复 CPU/内存快照表。不泛化摘要、高密度诊断直接跳过。</div>
+                            </div>
+                            <div class="node node-preview">
+                                <div class="node-title"><span class="node-dot"></span> generic-preview 通用预览</div>
+                                <div class="node-note">不推断语义。保留首 N 行 + 中间均匀采样 + 末 N 行，上限 6000 字符。prose / mixed / 未命中摘要的 structured 都走这里。</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 6. 净收益门槛（带放行出口） -->
+                    <div class="stage branch">
+                        <div class="branch-row">
+                            <div class="branch-main">
+                                <div class="node node-gate">
+                                    <div class="node-title"><span class="node-dot"></span> 净收益门槛</div>
+                                    <div class="node-note">必须同时：节省 ≥ 512 字符 <strong>且</strong> 节省比例 ≥ 10%</div>
+                                </div>
+                            </div>
+                            <span class="branch-tag">不达标</span>
+                            <div class="egress-conn"></div>
+                            <div class="egress-side">
+                                <div class="node node-egress">
+                                    <div class="node-title"><span class="node-dot"></span> 原样放行</div>
+                                    <div class="node-note">候选被丢弃 · 不落盘</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 7. 先提交再返回 -->
+                    <div class="stage">
+                        <div class="node node-store">
+                            <div class="node-title"><span class="node-dot"></span> 先提交，后返回</div>
+                            <div class="node-note">同一事务写入原文备份 + FTS5 全文索引 + 度量记录，提交成功才暴露视图。提交失败 → failed-open，不返回带不可用 handle 的精简视图。</div>
+                        </div>
+                    </div>
+
+                    <!-- 8. 返回精简视图 -->
+                    <div class="stage">
+                        <div class="node node-output">
+                            <div class="node-title"><span class="node-dot"></span> 返回精简视图 + handle 标记</div>
+                            <div class="node-note">用 <code>updatedToolOutput</code> 替换工具输出。handle 形如 <code>h-&lt;sha256&gt;</code>。</div>
+                        </div>
+                    </div>
+
+                    <!-- 9. 按需取回 -->
+                    <div class="stage">
+                        <div class="node node-tool">
+                            <div class="node-title"><span class="node-dot"></span> tok_retrieve 按需取回原文</div>
+                            <div class="node-note">关键词检索 / 按 <code>startLine</code>+<code>count</code> 取行 / 仅传 handle 取全文（上限 60000 字符）。</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 图例 -->
+                <div class="legend">
+                    <div class="legend-item">
+                        <div class="legend-color" style="background:#42a5f5;"></div>
+                        输入
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background:#ff9800;"></div>
+                        分类
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background:#667eea;"></div>
+                        压缩管道
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background:#ab47bc;"></div>
+                        通用预览
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background:#ff7043;"></div>
+                        门槛判定
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background:#8e44ad;"></div>
+                        存储
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background:#26a69a;"></div>
+                        返回
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color dashed"></div>
+                        放行出口
+                    </div>
+                </div>
+            </div>
+
+            <p style="font-size:0.85em; color:#888; margin-top:18px;">
+                分类结果不改变是否进入管道：够长的 prose / mixed 同样会走 <code>generic-preview</code>。最终保护由"净收益门槛 + 严格摘要识别 + 先提交后返回"三道关提供，而非"散文一律绕过"。
+            </p>
+        </div>
+
+        <!-- 内容分类 -->
+        <div class="card">
+            <h2>内容分类的作用</h2>
+            <p>分类不决定"压不压"，只决定"能否走语义摘要"。够长就进管道，不够长或无净收益就放行。</p>
+
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <thead>
+                    <tr>
+                        <th style="padding: 12px; text-align: left; background: #667eea; color: white;">分类</th>
+                        <th style="padding: 12px; text-align: left; background: #667eea; color: white;">语义摘要资格</th>
+                        <th style="padding: 12px; text-align: left; background: #667eea; color: white;">未命中摘要时</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;"><strong>structured</strong></td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">尝试 structured-digest（仅 Jest 日志套件 / 时间戳日志信号 / 重复快照表）</td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">退回 generic-preview</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;"><strong>prose</strong></td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">不摘要</td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">走 generic-preview（首尾 + 采样）</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px;"><strong>mixed</strong></td>
+                        <td style="padding: 12px;">不摘要</td>
+                        <td style="padding: 12px;">走 generic-preview（首尾 + 采样）</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>判断依据</h3>
+            <ul class="list-check">
+                <li>扩展名 / 文件名快筛（.log .json .yml .html 等直接判结构化）</li>
+                <li>二进制检测（含 NUL 或前 2KB 控制字符占比高）</li>
+                <li>强符号密度（<code>{}</code> <code>;</code> 占比）</li>
+                <li>标记标签密度（<code>&lt;tag&gt;</code> 频率）</li>
+                <li>行结构相似度（排除列表行后的前缀重复度）</li>
+                <li>JSON 合法性</li>
+                <li>自然语言密度（中文虚词 + 全角标点 + 英文虚词词边界）</li>
+                <li>是否存在 ANSI 颜色码</li>
+            </ul>
+            <p style="font-size:0.85em; color:#888; margin-top:10px;">
+                安全侧倾斜：有明显自然语言迹象时不会直接判 structured，避免散文被误摘要。
+            </p>
+        </div>
+
+        <!-- 安全机制 -->
+        <div class="card">
+            <h2>安全保障</h2>
+            <p>策略保守：宁可不压缩也不能丢失信息或暴露不可用 handle。</p>
+
+            <div class="gate-list">
+                <div class="gate-item">
+                    <div class="gate-number">1</div>
+                    <div class="gate-content">
+                        <strong>工具白名单</strong>
+                        <p>只拦 Bash 与 Read 的字符串文本字段，其他工具输出直接放行</p>
+                    </div>
+                </div>
+                <div class="gate-item">
+                    <div class="gate-number">2</div>
+                    <div class="gate-content">
+                        <strong>大小阈值</strong>
+                        <p>小于 10000 字符不进管道，避免对小输出徒增开销</p>
+                    </div>
+                </div>
+                <div class="gate-item">
+                    <div class="gate-number">3</div>
+                    <div class="gate-content">
+                        <strong>严格摘要识别</strong>
+                        <p>structured-digest 只认三类机器输出，不泛化；高密度诊断直接跳过不摘要</p>
+                    </div>
+                </div>
+                <div class="gate-item">
+                    <div class="gate-number">4</div>
+                    <div class="gate-content">
+                        <strong>收益验证</strong>
+                        <p>必须同时满足：节省 ≥ 512 字符 且 节省比例 ≥ 10%，否则放行</p>
+                    </div>
+                </div>
+                <div class="gate-item">
+                    <div class="gate-number">5</div>
+                    <div class="gate-content">
+                        <strong>先提交后返回</strong>
+                        <p>原文、FTS 索引、度量在同一事务提交成功后才暴露精简视图；提交失败则 failed-open，不返回带不可用 handle 的压缩版</p>
+                    </div>
+                </div>
+                <div class="gate-item">
+                    <div class="gate-number">6</div>
+                    <div class="gate-content">
+                        <strong>原文备份 · 放行不留痕</strong>
+                        <p>采用压缩的原文 100% 落盘、可按 handle 取回；未达标放行则不存原文、不加任何标记</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="comparison">
+                <div class="comparison-item good">
+                    <h4>我们的做法：可还原精简</h4>
+                    <p>规则变换 / 截断式延迟加载，省略部分落盘可取回，原文严格可还原</p>
+                </div>
+                <div class="comparison-item bad">
+                    <h4>不做的：有损摘要</h4>
+                    <p>小模型删"不重要"内容，无法还原，可能丢失关键信息</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 实际效果 -->
+        <div class="card">
+            <h2>处理示例</h2>
+
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <thead>
+                    <tr>
+                        <th style="padding: 12px; text-align: left; background: #667eea; color: white;">输入</th>
+                        <th style="padding: 12px; text-align: left; background: #667eea; color: white;">命中的策略</th>
+                        <th style="padding: 12px; text-align: left; background: #667eea; color: white;">结果</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">137,199 字符结构化日志</td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">structured-digest 日志信号摘要</td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee; color: #27ae60; font-weight: bold;">2,245 字符（省 98.4%）</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">约 5 万字符长输出</td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee;">generic-preview 通用预览</td>
+                        <td style="padding: 12px; border-bottom: 1px solid #eee; color: #27ae60;">约 6000 字符（预览上限）</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px;">省不足 512 字符 / 或不足 10%</td>
+                        <td style="padding: 12px;">未过净收益门槛</td>
+                        <td style="padding: 12px; color: #999;">原样放行</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="highlight-box" style="background: linear-gradient(135deg, #6b7689 0%, #4a5568 100%); margin-top:20px;">
+                <h3>关于这些数字</h3>
+                <p style="font-size:0.95em; line-height:1.7;">大小按 JavaScript <code>string.length</code>（UTF-16 代码单元）统计，不是实测 token 数，也不是账单或端到端成本节省。98.4% 是单条日志用例的实测压缩率，不等于真实工作流平均收益——项目目前不宣称 v2 已在真实场景中建立节省收益。</p>
+            </div>
+
+            <h3>收益</h3>
+            <ul class="list-check">
+                <li>减少进入上下文的字符量，降低 Token 消耗</li>
+                <li>省略部分落盘索引，按需取回，不丢信息</li>
+                <li>自动化处理，无需人工干预</li>
+                <li>不达门槛即原样放行，对短输出与无收益内容零副作用</li>
+            </ul>
+        </div>
+
+        <footer>
+            <p>SaveToken —— 保守的 Token 节省方案</p>
+        </footer>
+    </div>
+</body>
+</html>

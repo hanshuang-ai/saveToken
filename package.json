@@ -1,6 +1,6 @@
 {
   "name": "savetoken",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "description": "通用 token 节省插件 —— 内容感知核心 + 可插拔适配器",
   "type": "module",
   "scripts": {
@@ -13,7 +13,8 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@vue/compiler-sfc": "^3.5.42",
     "better-sqlite3": "^11.0.0",
-    "ts-morph": "^28.0.0"
+    "ts-morph": "^28.0.0",
+    "web-tree-sitter": "^0.27.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
